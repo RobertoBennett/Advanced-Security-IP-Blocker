@@ -50,6 +50,7 @@ class Advanced_Security_Blocker {
         add_action('wp_ajax_asb_get_login_stats', [$this, 'ajax_get_login_stats']);
         add_action('wp_ajax_asb_get_recent_attempts', [$this, 'ajax_get_recent_attempts']);
         add_action('wp_ajax_asb_get_block_history', [$this, 'ajax_get_block_history']);
+        add_action('wp_ajax_asb_get_blocked_ips_table', [$this, 'ajax_get_blocked_ips_table']);
 
         // Создаем таблицу для логирования попыток входа
         register_activation_hook(__FILE__, [$this, 'create_login_attempts_table']);
@@ -57,6 +58,142 @@ class Advanced_Security_Blocker {
 
         // Проверяем и создаем таблицы при необходимости
         add_action('admin_init', [$this, 'check_and_create_tables']);
+    }
+
+    // AJAX: Получение таблицы заблокированных IP
+    public function ajax_get_blocked_ips_table() {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        check_ajax_referer('asb_ajax_nonce', 'nonce');
+
+        $per_page = 20;
+        $current_page = isset($_POST['page']) ? max(1, intval($_POST['page'])) : 1;
+        $search = isset($_POST['search']) ? sanitize_text_field($_POST['search']) : '';
+
+        // Получаем список всех заблокированных IP с пагинацией и поиском
+        $blocked_ips_data = $this->get_all_blocked_ips($search, $current_page, $per_page);
+        $blocks_to_show = $blocked_ips_data['blocks'];
+        $total_blocks = $blocked_ips_data['total'];
+        $total_pages = $blocked_ips_data['pages'];
+
+        ob_start();
+        ?>
+        <?php if (empty($blocks_to_show)) : ?>
+            <p>Нет заблокированных IP адресов.</p>
+        <?php else : ?>
+            <!-- Пагинация -->
+            <div class="tablenav top">
+                <div class="tablenav-pages">
+                    <span class="displaying-num"><?php echo $total_blocks; ?> элементов</span>
+                    <?php if ($total_pages > 1) : ?>
+                        <span class="pagination-links">
+                            <?php if ($current_page > 1) : ?>
+                                <a class="first-page button" href="#" data-page="1">«</a>
+                                <a class="prev-page button" href="#" data-page="<?php echo $current_page - 1; ?>">‹</a>
+                            <?php endif; ?>
+
+                            <span class="paging-input">
+                                <span class="current-page"><?php echo $current_page; ?></span> из
+                                <span class="total-pages"><?php echo $total_pages; ?></span>
+                            </span>
+
+                            <?php if ($current_page < $total_pages) : ?>
+                                <a class="next-page button" href="#" data-page="<?php echo $current_page + 1; ?>">›</a>
+                                <a class="last-page button" href="#" data-page="<?php echo $total_pages; ?>">»</a>
+                            <?php endif; ?>
+                        </span>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <table class="attempts-table">
+                <thead>
+                    <tr>
+                        <th>IP адрес / ASN</th>
+                        <th>Тип блокировки</th>
+                        <th>Тип записи</th>
+                        <th>Последняя попытка</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($blocks_to_show as $block) : ?>
+                        <tr>
+                            <td><?php echo esc_html($block['ip']); ?></td>
+                            <td>
+                                <?php
+                                $type_labels = [
+                                    'temporary' => '<span style="color: orange;">Временная</span>',
+                                    'permanent' => '<span style="color: red;">Постоянная</span>',
+                                    'htaccess' => '<span style="color: purple;">Через .htaccess</span>'
+                                ];
+                                echo $type_labels[$block['type']];
+                                ?>
+                            </td>
+                            <td>
+                                <?php
+                                $entry_type = 'IP';
+                                if (strpos($block['ip'], 'AS') === 0) {
+                                    $entry_type = 'ASN';
+                                } elseif (strpos($block['ip'], '/') !== false) {
+                                    $entry_type = 'CIDR';
+                                }
+                                echo $entry_type;
+                                ?>
+                            </td>
+                            <td><?php echo esc_html($block['last_attempt']); ?></td>
+                            <td>
+                                <a href="<?php echo wp_nonce_url(
+                                    admin_url('options-general.php?page=advanced-security-blocker&unblock_ip=' . $block['ip'] . '&tab=manage-blocks&paged=' . $current_page . '&s=' . urlencode($search)),
+                                    'unblock_ip'
+                                ); ?>" class="button" onclick="return confirm('Вы уверены, что хотите разблокировать этот IP адрес?');">
+                                    Разблокировать
+                                </a>
+                                <button class="button view-history-btn" data-ip="<?php echo esc_attr($block['ip']); ?>">
+                                    История
+                                </button>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+
+            <!-- Пагинация внизу -->
+            <div class="tablenav bottom">
+                <div class="tablenav-pages">
+                    <span class="displaying-num"><?php echo $total_blocks; ?> элементов</span>
+                    <?php if ($total_pages > 1) : ?>
+                        <span class="pagination-links">
+                            <?php if ($current_page > 1) : ?>
+                                <a class="first-page button" href="#" data-page="1">«</a>
+                                <a class="prev-page button" href="#" data-page="<?php echo $current_page - 1; ?>">‹</a>
+                            <?php endif; ?>
+
+                            <span class="paging-input">
+                                <span class="current-page"><?php echo $current_page; ?></span> из
+                                <span class="total-pages"><?php echo $total_pages; ?></span>
+                            </span>
+
+                            <?php if ($current_page < $total_pages) : ?>
+                                <a class="next-page button" href="#" data-page="<?php echo $current_page + 1; ?>">›</a>
+                                <a class="last-page button" href="#" data-page="<?php echo $total_pages; ?>">»</a>
+                            <?php endif; ?>
+                        </span>
+                    <?php endif; ?>
+                </div>
+            </div>
+        <?php endif; ?>
+        <?php
+        $table_html = ob_get_clean();
+
+        wp_send_json_success([
+            'table_html' => $table_html,
+            'total' => $total_blocks,
+            'pages' => $total_pages,
+            'current_page' => $current_page
+        ]);
     }
 
     // Проверка и создание необходимых таблиц
@@ -100,6 +237,7 @@ class Advanced_Security_Blocker {
         delete_option('asb_blocked_ips_list');
         delete_option('asb_wp_blocked_ips');
         delete_option('asb_whitelist_ips');
+        delete_option('asb_clear_cache_enabled');
 
         // Восстанавливаем чистый .htaccess
         $htaccess_path = ABSPATH . '.htaccess';
@@ -327,8 +465,10 @@ class Advanced_Security_Blocker {
         // Логируем действие
         error_log("Security Blocker: IP $ip_address разблокирован администратором. Причина: $reason");
 
-        // Очищаем кеш
-        $this->cache_handler->clear_all_caches();
+        // Очищаем кеш, если включено
+        if (get_option('asb_clear_cache_enabled', '1')) {
+            $this->cache_handler->clear_all_caches();
+        }
     }
 
     // Добавление IP в белый список
@@ -553,6 +693,9 @@ class Advanced_Security_Blocker {
         }
         if (get_option('asb_whitelist_ips') === false) {
             update_option('asb_whitelist_ips', '');
+        }
+        if (get_option('asb_clear_cache_enabled') === false) {
+            update_option('asb_clear_cache_enabled', '1');
         }
     }
 
@@ -970,6 +1113,11 @@ class Advanced_Security_Blocker {
             $default_bots = "360Spider|404checker|80legs|Abonti|Aboundex|AhrefsBot|Alexibot|Applebot|Arachni|ASPSeek|Asterias|BackDoorBot|BackStreet|BackWeb|Badass|Bandit|Baiduspider|BatchFTP|Bigfoot|BotALot|Buddy|BuiltBotTough|Bullseye|BunnySlippers|CheeseBot|CherryPicker|ChinaClaw|Collector|Copier|CopyRightCheck|cosmos|Crescent|Custo|CyberSpyder|DISCo|DIIbot|DittoSpyder|Download|Downloader|Dumbot|EasouSpider|eCatch|EirGrabber|EmailCollector|EmailSiphon|EmailWolf|Express|Extractor|EyeNetIE|FlashGet|GetRight|GetWeb|Grafula|HMView|HTTrack|InterGET|JetCar|larbin|LeechFTP|Mister|Navroad|NearSite|NetAnts|NetSpider|NetZIP|Nutch|Octopus|PageGrabber|pavuk|pcBrowser|PeoplePal|planetwork|psbot|purebot|pycurl|RealDownload|ReGet|Rippers|SiteSnagger|SmartDownload|SuperBot|SuperHTTP|Surfbot|tAkeOut|VoidEYE|WebAuto|WebBandit|WebCopier|WebFetch|WebLeacher|WebReaper|WebSauger|WebStripper|WebWhacker|WebZIP|Wget|Widow|WWWOFFLE|Xenu|Zeus";
             update_option('asb_blocked_bots', $default_bots);
         }
+
+        // Настройка по умолчанию для очистки кеша
+        if (get_option('asb_clear_cache_enabled') === false) {
+            update_option('asb_clear_cache_enabled', '1');
+        }
     }
 
     public function handle_backup_request() {
@@ -1336,10 +1484,10 @@ class Advanced_Security_Blocker {
             font-size: 2em;
             font-weight: bold;
             color: #0073aa;
+            margin-bottom: 5px;
         }
         .stat-label {
             color: #666;
-            margin-top: 5px;
         }
         .attempts-table {
             width: 100%;
@@ -1411,6 +1559,7 @@ class Advanced_Security_Blocker {
             border-radius: 3px;
             cursor: pointer;
             font-size: 12px;
+            margin-left: 5px;
         }
         .view-history-btn:hover {
             background: #5a6268;
@@ -1434,6 +1583,7 @@ class Advanced_Security_Blocker {
             width: 80%;
             max-width: 800px;
             border-radius: 5px;
+            position: relative;
         }
         .close {
             color: #aaa;
@@ -1441,6 +1591,9 @@ class Advanced_Security_Blocker {
             font-size: 28px;
             font-weight: bold;
             cursor: pointer;
+            position: absolute;
+            top: 10px;
+            right: 15px;
         }
         .close:hover {
             color: black;
@@ -1470,6 +1623,33 @@ class Advanced_Security_Blocker {
         }
         .tablenav .displaying-num {
             margin-right: 10px;
+            line-height: 30px;
+        }
+        .tablenav .pagination-links {
+            display: inline-block;
+        }
+        .tablenav .pagination-links a {
+            display: inline-block;
+            padding: 3px 5px;
+            margin: 0 2px;
+            border: 1px solid #ccc;
+            background: #e5e5e5;
+            text-decoration: none;
+        }
+        .tablenav .pagination-links a:hover {
+            background: #d5d5d5;
+        }
+        .tablenav .paging-input {
+            display: inline-block;
+            margin: 0 5px;
+            line-height: 30px;
+        }
+        .cache-settings {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 4px;
+            padding: 15px;
+            margin: 15px 0;
         }
         </style>
         <?php
@@ -1549,7 +1729,9 @@ class Advanced_Security_Blocker {
             $ips = isset($_POST['ip_addresses']) ? sanitize_textarea_field($_POST['ip_addresses']) : '';
             $result = $this->update_ip_rules($ips);
             if ($result === true) {
-                $this->cache_handler->clear_all_caches();
+                if (get_option('asb_clear_cache_enabled', '1')) {
+                    $this->cache_handler->clear_all_caches();
+                }
                 $success = 'IP правила успешно обновлены!';
             } else {
                 $error = 'Ошибка IP правил: ' . $result;
@@ -1566,7 +1748,9 @@ class Advanced_Security_Blocker {
 
             $result = $this->update_login_protection($whitelist_ips, $protect_wp_login, $protect_xmlrpc);
             if ($result === true) {
-                $this->cache_handler->clear_all_caches();
+                if (get_option('asb_clear_cache_enabled', '1')) {
+                    $this->cache_handler->clear_all_caches();
+                }
                 $success = 'Защита wp-login.php и xmlrpc.php успешно обновлена!';
             } else {
                 $error = 'Ошибка защиты входа: ' . $result;
@@ -1579,7 +1763,9 @@ class Advanced_Security_Blocker {
             update_option('asb_dangerous_files', $dangerous_files);
             $result = $this->update_file_protection($dangerous_files);
             if ($result === true) {
-                $this->cache_handler->clear_all_caches();
+                if (get_option('asb_clear_cache_enabled', '1')) {
+                    $this->cache_handler->clear_all_caches();
+                }
                 $success = 'Защита от опасных файлов успешно обновлена!';
             } else {
                 $error = 'Ошибка защиты файлов: ' . $result;
@@ -1592,7 +1778,9 @@ class Advanced_Security_Blocker {
             update_option('asb_blocked_bots', $blocked_bots);
             $result = $this->update_bot_protection($blocked_bots);
             if ($result === true) {
-                $this->cache_handler->clear_all_caches();
+                if (get_option('asb_clear_cache_enabled', '1')) {
+                    $this->cache_handler->clear_all_caches();
+                }
                 $success = 'Защита от ботов успешно обновлена!';
             } else {
                 $error = 'Ошибка защиты от ботов: ' . $result;
@@ -1612,15 +1800,26 @@ class Advanced_Security_Blocker {
             update_option('asb_auto_add_to_htaccess', (isset($_POST['auto_add_to_htaccess']) && $_POST['auto_add_to_htaccess'] === '1') ? '1' : '0');
             update_option('asb_email_notifications', (isset($_POST['email_notifications']) && $_POST['email_notifications'] === '1') ? '1' : '0');
 
-            $this->cache_handler->clear_all_caches();
+            if (get_option('asb_clear_cache_enabled', '1')) {
+                $this->cache_handler->clear_all_caches();
+            }
             $success = 'Настройки защиты от брутфорс атак успешно обновлены!';
+        }
+
+        // Обработка настроек очистки кеша
+        if (isset($_POST['submit_cache_settings'])) {
+            check_admin_referer('security_blocker_update');
+            update_option('asb_clear_cache_enabled', (isset($_POST['clear_cache_enabled']) && $_POST['clear_cache_enabled'] === '1') ? '1' : '0');
+            $success = 'Настройки очистки кеша успешно обновлены!';
         }
 
         // Очистка старых записей
         if (isset($_POST['cleanup_attempts'])) {
             check_admin_referer('security_blocker_update');
             $this->cleanup_old_attempts();
-            $this->cache_handler->clear_all_caches();
+            if (get_option('asb_clear_cache_enabled', '1')) {
+                $this->cache_handler->clear_all_caches();
+            }
             $success = 'Старые записи попыток входа успешно очищены!';
         }
 
@@ -1729,855 +1928,970 @@ class Advanced_Security_Blocker {
     </div>
 
     <!-- Вкладка защиты wp-login.php и xmlrpc.php -->
-    <<div id="tab-login-protection" class="security-tab-content">
-    <h2>Ограничение доступа к wp-login.php и xmlrpc.php</h2>
-    <div class="security-warning">
-        <strong>Внимание!</strong> Убедитесь, что ваш IP-адрес включен в белый список, чтобы вы не потеряли доступ к админ-панели!
-        <br>Ваш текущий IP: <strong><?php echo esc_html($current_user_ip); ?></strong>
-    </div>
-    <div class="asn-info">
-        <strong>Поддержка ASN!</strong> Можно добавлять целые сети провайдеров, например <code>AS15169</code> для Google.
+    <div id="tab-login-protection" class="security-tab-content">
+      <h2>Ограничение доступа к wp-login.php и xmlrpc.php</h2>
+  <div class="security-warning">
+      <strong>Внимание!</strong> Убедитесь, что ваш IP-адрес включен в белый список, чтобы вы не потеряли доступ к админ-панели!
+      <br>Ваш текущий IP: <strong><?php echo esc_html($current_user_ip); ?></strong>
+  </div>
+  <div class="asn-info">
+      <strong>Поддержка ASN!</strong> Можно добавлять целые сети провайдеров, например <code>AS15169</code> для Google.
+  </div>
+
+  <form method="post">
+      <?php wp_nonce_field('security_blocker_update'); ?>
+      <!-- Скрытые поля для правильной обработки чекбоксов -->
+      <input type="hidden" name="protect_wp_login" value="0">
+      <input type="hidden" name="protect_xmlrpc" value="0">
+
+      <div class="protection-options">
+          <h3>Выберите файлы для защиты:</h3>
+          <div class="protection-checkbox">
+              <input type="checkbox" id="protect_wp_login" name="protect_wp_login" value="1"
+                  <?php checked($current_protection['wp_login']); ?>>
+              <label for="protect_wp_login">
+                  <strong>wp-login.php</strong> - защита страницы входа в админ-панель
+              </label>
+          </div>
+          <div class="protection-checkbox">
+              <input type="checkbox" id="protect_xmlrpc" name="protect_xmlrpc" value="1"
+                  <?php checked($current_protection['xmlrpc']); ?>>
+              <label for="protect_xmlrpc">
+                  <strong>xmlrpc.php</strong> - защита XML-RPC интерфейса (используется для мобильных приложений)
+              </label>
+          </div>
+          <p class="description">
+              <strong>xmlrpc.php</strong> может использоваться для атак методом перебора паролей.
+              Рекомендуется заблокировать его, если вы не используете мобильные приложения WordPress или внешние сервисы.
+          </p>
+      </div>
+
+      <table class="form-table">
+          <tr>
+              <th><label for="login_whitelist_ips">Разрешенные IP:</label></th>
+              <td>
+                  <div class="ip-blocker-textarea-wrapper">
+                      <div class="ip-blocker-line-numbers"></div>
+                      <textarea name="login_whitelist_ips" id="login_whitelist_ips" rows="10" cols="50"
+                          class="large-text code" placeholder="<?php echo esc_attr($current_user_ip); ?>&#10;192.168.1.0/24&#10;AS15169"><?php
+                          echo esc_textarea($current_whitelist);
+                      ?></textarea>
+                  </div>
+                  <p class="description ip-blocker-description">
+                      По одной записи на строку. Поддерживаемые форматы:<br>
+                      • Отдельные IP: <code>192.168.1.100</code><br>
+                      • CIDR диапазоны: <code>192.168.1.0/24</code><br>
+                      • ASN (автономные системы): <code>AS15169</code> или <code>15169</code><br>
+                      • Маска подсети: <code>192.168.1.0 255.255.255.0</code><br>
+                      • Частичные IP: <code>192.168.1</code><br>
+                      <em>ASN автоматически преобразуются в списки разрешенных диапазонов</em>
+                  </p>
+              </td>
+          </tr>
+      </table>
+      <p>
+          <button type="submit" name="submit_login_protection" class="button button-primary">
+              Обновить защиту
+          </button>
+          <button type="button" class="button add-my-ip-btn" onclick="addCurrentIP();">
+              Добавить мой IP
+          </button>
+      </p>
+  </form>
+  </div>
+
+  <!-- Вкладка блокировки файлов -->
+  <div id="tab-file-protection" class="security-tab-content">
+      <h2>Блокировка опасных файлов</h2>
+      <div class="security-info">
+          Эта функция блокирует доступ к потенциально опасным файлам. Можно использовать маски файлов (например, *.log для всех .log файлов).
+      </div>
+      <form method="post">
+          <?php wp_nonce_field('security_blocker_update'); ?>
+          <table class="form-table">
+              <tr>
+                  <th><label for="dangerous_files">Заблокированные файлов:</label></th>
+                  <td>
+                      <textarea name="dangerous_files" id="dangerous_files" rows="15" cols="80"
+                          class="simple-textarea" placeholder=".htaccess"><?php
+                          echo esc_textarea($current_files);
+                      ?></textarea>
+                      <p class="description">По одному файлу/маске на строку. Поддерживаются маски с * (например, *.log, *.bak)</p>
+                  </td>
+              </tr>
+          </table>
+          <p>
+              <button type="submit" name="submit_file_protection" class="button button-primary">
+                  Обновить защиту файлов
+              </button>
+          </p>
+      </form>
+  </div>
+
+  <!-- Вкладка защиты от ботов -->
+  <div id="tab-bot-protection" class="security-tab-content">
+      <h2>Блокировка ботов и нежелательных User-Agent</h2>
+      <div class="security-info">
+          Список User-Agent ботов, разделенных символом "|". Частичные и точные User-Agent будут заблокированы.
+      </div>
+      <form method="post">
+          <?php wp_nonce_field('security_blocker_update'); ?>
+          <table class="form-table">
+              <tr>
+                  <th><label for="blocked_bots">Заблокированные User-Agent:</label></th>
+                  <td>
+                      <textarea name="blocked_bots" id="blocked_bots" rows="10" cols="80"
+                          class="simple-textarea" placeholder="BadBot|SpamBot|Crawler"><?php
+                          echo esc_textarea($current_bots);
+                      ?></textarea>
+                      <p class="description">User-Agent строки, разделенные символом "|". Поддерживаются частичные совпадения.</p>
+                  </td>
+              </tr>
+          </table>
+          <p>
+              <button type="submit" name="submit_bot_protection" class="button button-primary">
+                  Обновить защиту от ботов
+              </button>
+          </p>
+      </form>
+  </div>
+
+  <!-- Вкладка защиты от брутфорс атак -->
+  <div id="tab-brute-force" class="security-tab-content">
+      <h2>Защита от брутфорс атак</h2>
+      <div class="brute-force-info">
+          <strong>Автоматическая защита!</strong> Система автоматически блокирует IP адреса при превышении лимита неудачных попыток входа.
+      </div>
+
+      <!-- Статистика -->
+      <div class="stats-grid">
+          <div class="stat-card">
+              <div class="stat-number" id="stat-total-attempts"><?php echo $login_stats['total_attempts']; ?></div>
+              <div class="stat-label">Попыток входа за 24 часа</div>
+          </div>
+          <div class="stat-card">
+              <div class="stat-number" id="stat-blocked-ips"><?php echo $login_stats['blocked_ips']; ?></div>
+              <div class="stat-label">Заблокированных IP за 24 часа</div>
+          </div>
+      </div>
+
+      <!-- Настройки -->
+      <form method="post">
+          <?php wp_nonce_field('security_blocker_update'); ?>
+          <!-- Скрытые поля для правильной обработки чекбоксов -->
+          <input type="hidden" name="brute_force_enabled" value="0">
+          <input type="hidden" name="auto_add_to_htaccess" value="0">
+          <input type="hidden" name="email_notifications" value="0">
+
+          <table class="form-table">
+              <tr>
+                  <th><label for="brute_force_enabled">Включить защиту:</label></th>
+                  <td>
+                      <input type="checkbox" id="brute_force_enabled" name="brute_force_enabled" value="1"
+                          <?php checked(get_option('asb_brute_force_enabled')); ?>>
+                      <label for="brute_force_enabled">Автоматически блокировать IP при брутфорс атаках</label>
+                  </td>
+              </tr>
+              <tr>
+                  <th><label for="max_attempts">Максимум попыток:</label></th>
+                  <td>
+                      <input type="number" id="max_attempts" name="max_attempts" min="1" max="50"
+                          value="<?php echo esc_attr(get_option('asb_max_attempts', 5)); ?>">
+                      <p class="description">Количество неудачных попыток входа перед блокировкой</p>
+                  </td>
+              </tr>
+              <tr>
+                  <th><label for="time_window">Временное окно (минуты):</label></th>
+                  <td>
+                      <input type="number" id="time_window" name="time_window" min="1" max="1440"
+                          value="<?php echo esc_attr(get_option('asb_time_window', 15)); ?>">
+                      <p class="description">Период времени для подсчёта попыток входа</p>
+                  </td>
+              </tr>
+              <tr>
+                  <th><label for="block_duration">Длительность блокировки (минуты):</label></th>
+                  <td>
+                      <input type="number" id="block_duration" name="block_duration" min="0" max="10080"
+                          value="<?php echo esc_attr(get_option('asb_block_duration', 60)); ?>">
+                      <p class="description">0 = постоянная блокировка (требует ручного разблокирования)</p>
+                  </td>
+              </tr>
+              <tr>
+                  <th><label for="auto_add_to_htaccess">Добавлять в .htaccess:</label></th>
+                  <td>
+                      <input type="checkbox" id="auto_add_to_htaccess" name="auto_add_to_htaccess" value="1"
+                          <?php checked(get_option('asb_auto_add_to_htaccess')); ?>>
+                      <label for="auto_add_to_htaccess">Автоматически добавлять заблокированные IP в .htaccess</label>
+                      <p class="description">Если отключено, блокировка будет работать только на уровне WordPress</p>
+                  </td>
+              </tr>
+              <tr>
+                  <th><label for="email_notifications">Email уведомления:</label></th>
+                  <td>
+                      <input type="checkbox" id="email_notifications" name="email_notifications" value="1"
+                          <?php checked(get_option('asb_email_notifications')); ?>>
+                      <label for="email_notifications">Отправлять уведомления администратору о блокировках</label>
+                  </td>
+              </tr>
+          </table>
+          <p>
+              <button type="submit" name="submit_brute_force_protection" class="button button-primary">
+                  Сохранить настройки
+              </button>
+              <button type="submit" name="cleanup_attempts" class="button"
+                  onclick="return confirm('Удалить все старые записи попыток входа?');">
+                  Очистить старые записи
+              </button>
+          </p>
+      </form>
+
+      <!-- Контролы обновления -->
+      <div class="auto-refresh-controls">
+          <label>
+              <input type="checkbox" id="auto-refresh-stats" checked>
+              Автоматическое обновление каждые 30 секунд
+          </label>
+          <button id="manual-refresh-stats" class="refresh-button">Обновить сейчас</button>
+          <span id="last-updated">Последнее обновление: <?php echo date('H:i:s'); ?></span>
+      </div>
+
+      <!-- Топ IP по попыткам -->
+      <div id="top-ips-container">
+          <h3>Топ IP адресов по попыток входа (24 часа)</h3>
+          <table class="attempts-table">
+              <thead>
+                  <tr>
+                      <th>IP адрес</th>
+                      <th>Попыток</th>
+                      <th>Статус</th>
+                  </tr>
+              </thead>
+              <tbody id="top-ips-body">
+                  <?php foreach ($login_stats['top_ips'] as $ip_stat) : ?>
+                      <tr>
+                          <td><?php echo esc_html($ip_stat->ip_address); ?></td>
+                          <td><?php echo esc_html($ip_stat->attempts); ?></td>
+                          <td>
+                              <?php if ($ip_stat->is_blocked) : ?>
+                                  <span class="blocked-ip">Заблокирован</span>
+                              <?php else : ?>
+                                  <span class="normal-ip">Активен</span>
+                              <?php endif; ?>
+                          </td>
+                      </tr>
+                  <?php endforeach; ?>
+              </tbody>
+          </table>
+      </div>
+
+      <!-- Последние попытки входа -->
+      <div id="recent-attempts-container">
+          <h3>Последние попытки входа</h3>
+          <table class="attempts-table">
+              <thead>
+                  <tr>
+                      <th>Время</th>
+                      <th>IP адрес</th>
+                      <th>Пользователь</th>
+                      <th>Статус</th>
+                      <th>User-Agent</th>
+                  </tr>
+              </thead>
+              <tbody id="recent-attempts-body">
+                  <?php foreach ($login_stats['recent_attempts'] as $attempt) : ?>
+                      <tr>
+                          <td><?php echo esc_html(date('d.m.Y H:i:s', strtotime($attempt->attempt_time))); ?></td>
+                          <td><?php echo esc_html($attempt->ip_address); ?></td>
+                          <td><?php echo esc_html($attempt->username); ?></td>
+                          <td>
+                              <?php if ($attempt->blocked) : ?>
+                                  <span class="blocked-ip">Заблокирован</span>
+                              <?php else : ?>
+                                  <span class="normal-ip">Неудачная попытка</span>
+                              <?php endif; ?>
+                          </td>
+                          <td title="<?php echo esc_attr($attempt->user_agent); ?>">
+                              <?php echo esc_html(substr($attempt->user_agent, 0, 50)) . (strlen($attempt->user_agent) > 50 ? '...' : ''); ?>
+                          </td>
+                      </tr>
+                  <?php endforeach; ?>
+              </tbody>
+          </table>
+      </div>
+  </div>
+
+  <!-- Вкладка управления блокировками -->
+  <div id="tab-manage-blocks" class="security-tab-content">
+      <h2>Управление заблокированными IP адресами</h2>
+
+      <div class="security-info">
+          На этой странице вы можете управлять всеми заблокированными IP адресами.
+          Вы можете разблокировать IP адреса, которые были заблокированы автоматически или вручную.
+      </div>
+
+      <!-- Поиск по IP -->
+      <div class="card">
+          <h3>Поиск по IP адресам</h3>
+          <form method="get" id="ip-search-form">
+              <input type="hidden" name="page" value="advanced-security-blocker">
+              <input type="hidden" name="tab" value="manage-blocks">
+              <table class="form-table">
+                  <tr>
+                      <th><label for="ip-search">Поиск IP:</label></th>
+                      <td>
+                          <input type="text" id="ip-search" name="s" value="<?php echo esc_attr($search); ?>"
+                              class="regular-text" placeholder="Введите IP адрес для поиска">
+                          <button type="submit" class="button">Поиск</button>
+                          <?php if (!empty($search)) : ?>
+                              <a href="<?php echo admin_url('options-general.php?page=advanced-security-blocker&tab=manage-blocks'); ?>" class="button" id="reset-search">Сбросить</a>
+                          <?php endif; ?>
+                      </td>
+                  </tr>
+              </table>
+          </form>
+      </div>
+
+      <div class="card">
+          <h3>Заблокированные IP адреса</h3>
+          <div id="blocked-ips-table-container">
+              <?php if (empty($blocks_to_show)) : ?>
+                  <p>Нет заблокированных IP адресов.</p>
+              <?php else : ?>
+                  <!-- Пагинация -->
+                  <div class="tablenav top">
+                      <div class="tablenav-pages">
+                          <span class="displaying-num"><?php echo $total_blocks; ?> элементов</span>
+                          <?php if ($total_pages > 1) : ?>
+                              <span class="pagination-links">
+                                  <?php if ($current_page > 1) : ?>
+                                      <a class="first-page button" href="#" data-page="1">«</a>
+                                      <a class="prev-page button" href="#" data-page="<?php echo $current_page - 1; ?>">‹</a>
+                                  <?php endif; ?>
+
+                                  <span class="paging-input">
+                                      <span class="current-page"><?php echo $current_page; ?></span> из
+                                      <span class="total-pages"><?php echo $total_pages; ?></span>
+                                  </span>
+
+                                  <?php if ($current_page < $total_pages) : ?>
+                                      <a class="next-page button" href="#" data-page="<?php echo $current_page + 1; ?>">›</a>
+                                      <a class="last-page button" href="#" data-page="<?php echo $total_pages; ?>">»</a>
+                                  <?php endif; ?>
+                              </span>
+                          <?php endif; ?>
+                      </div>
+                  </div>
+
+                  <table class="attempts-table">
+                      <thead>
+                          <tr>
+                              <th>IP адрес / ASN</th>
+                              <th>Тип блокировки</th>
+                              <th>Тип записи</th>
+                              <th>Последняя попытка</th>
+                              <th>Действия</th>
+                          </tr>
+                      </thead>
+                      <tbody>
+                          <?php foreach ($blocks_to_show as $block) : ?>
+                              <tr>
+                                  <td><?php echo esc_html($block['ip']); ?></td>
+                                  <td>
+                                      <?php
+                                      $type_labels = [
+                                          'temporary' => '<span style="color: orange;">Временная</span>',
+                                          'permanent' => '<span style="color: red;">Постоянная</span>',
+                                          'htaccess' => '<span style="color: purple;">Через .htaccess</span>'
+                                      ];
+                                      echo $type_labels[$block['type']];
+                                      ?>
+                                  </td>
+                                  <td>
+                                      <?php
+                                      $entry_type = 'IP';
+                                      if (strpos($block['ip'], 'AS') === 0) {
+                                          $entry_type = 'ASN';
+                                      } elseif (strpos($block['ip'], '/') !== false) {
+                                          $entry_type = 'CIDR';
+                                      }
+                                      echo $entry_type;
+                                      ?>
+                                  </td>
+                                  <td><?php echo esc_html($block['last_attempt']); ?></td>
+                                  <td>
+                                      <a href="<?php echo wp_nonce_url(
+                                          admin_url('options-general.php?page=advanced-security-blocker&unblock_ip=' . $block['ip'] . '&tab=manage-blocks&paged=' . $current_page . '&s=' . urlencode($search)),
+                                          'unblock_ip'
+                                      ); ?>" class="button" onclick="return confirm('Вы уверены, что хотите разблокировать этот IP адрес?');">
+                                          Разблокировать
+                                      </a>
+                                      <button class="button view-history-btn" data-ip="<?php echo esc_attr($block['ip']); ?>">
+                                          История
+                                      </button>
+                                  </td>
+                              </tr>
+                          <?php endforeach; ?>
+                      </tbody>
+                  </table>
+
+                  <!-- Пагинация внизу -->
+                  <div class="tablenav bottom">
+                      <div class="tablenav-pages">
+                          <span class="displaying-num"><?php echo $total_blocks; ?> элементов</span>
+                          <?php if ($total_pages > 1) : ?>
+                              <span class="pagination-links">
+                                  <?php if ($current_page > 1) : ?>
+                                      <a class="first-page button" href="#" data-page="1">«</a>
+                                      <a class="prev-page button" href="#" data-page="<?php echo $current_page - 1; ?>">‹</a>
+                                  <?php endif; ?>
+
+                                  <span class="paging-input">
+                                      <span class="current-page"><?php echo $current_page; ?></span> из
+                                      <span class="total-pages"><?php echo $total_pages; ?></span>
+                                  </span>
+
+                                  <?php if ($current_page < $total_pages) : ?>
+                                      <a class="next-page button" href="#" data-page="<?php echo $current_page + 1; ?>">›</a>
+                                      <a class="last-page button" href="#" data-page="<?php echo $total_pages; ?>">»</a>
+                                  <?php endif; ?>
+                              </span>
+                          <?php endif; ?>
+                      </div>
+                  </div>
+              <?php endif; ?>
+          </div>
+      </div>
+
+      <div class="card">
+          <h3>История разблокировок</h3>
+
+          <?php if (empty($unblock_history)) : ?>
+              <p>Нет записей в истории разблокировок.</p>
+          <?php else : ?>
+              <table class="attempts-table">
+                  <thead>
+                      <tr>
+                          <th>IP адрес</th>
+                          <th>Время разблокировки</th>
+                          <th>Причина</th>
+                          <th>Кем разблокирован</th>
+                      </tr>
+                  </thead>
+                  <tbody>
+                      <?php foreach ($unblock_history as $unblock) : ?>
+                          <tr>
+                              <td><?php echo esc_html($unblock->ip_address); ?></td>
+                              <td><?php echo esc_html(date('d.m.Y H:i:s', strtotime($unblock->unblock_time))); ?></td>
+                              <td><?php echo esc_html($unblock->unblock_reason); ?></td>
+                              <td><?php echo esc_html($unblock->unblocked_by); ?></td>
+                          </tr>
+                      <?php endforeach; ?>
+                  </tbody>
+              </table>
+          <?php endif; ?>
+      </div>
+
+      <div class="card">
+          <h3>Добавить IP в черный список</h3>
+          <form method="post">
+              <?php wp_nonce_field('security_blocker_update'); ?>
+              <table class="form-table">
+                  <tr>
+                      <th><label for="manual_block_ip">IP адрес:</label></th>
+                      <td>
+                          <input type="text" name="manual_block_ip" id="manual_block_ip" class="regular-text"
+                              placeholder="192.168.0.1 или 192.168.0.0/24">
+                          <p class="description">Введите IP адрес или CIDR диапазон для блокировки</p>
+                      </td>
+                  </tr>
+                  <tr>
+    <th><label for="block_reason">Причина блокировки:</label></th>
+    <td>
+        <input type="text" name="block_reason" id="block_reason" class="regular-text"
+            placeholder="Нежелательный трафик">
+        <p class="description">Укажите причину блокировки для ведения лога</p>
+    </td>
+</tr>
+</table>
+<p>
+    <button type="submit" name="submit_manual_block" class="button button-primary">
+        Заблокировать IP
+    </button>
+</p>
+</form>
+</div>
+</div>
+
+<!-- Вкладка белого списка -->
+<div id="tab-whitelist" class="security-tab-content">
+    <h2>Белый список IP адресов</h2>
+
+    <div class="security-info">
+        IP адреса в белом списке никогда не будут заблокированы системой, даже при множественных неудачных попыток входа.
     </div>
 
-    <form method="post">
-        <?php wp_nonce_field('security_blocker_update'); ?>
-        <!-- Скрытые поля для правильной обработки чекбоксов -->
-        <input type="hidden" name="protect_wp_login" value="0">
-        <input type="hidden" name="protect_xmlrpc" value="0">
+    <div class="card">
+        <h3>Текущий белый список</h3>
 
-        <div class="protection-options">
-            <h3>Выберите файлы для защиты:</h3>
-            <div class="protection-checkbox">
-                <input type="checkbox" id="protect_wp_login" name="protect_wp_login" value="1"
-                    <?php checked($current_protection['wp_login']); ?>>
-                <label for="protect_wp_login">
-                    <strong>wp-login.php</strong> - защита страницы входа в админ-панель
-                </label>
-            </div>
-            <div class="protection-checkbox">
-                <input type="checkbox" id="protect_xmlrpc" name="protect_xmlrpc" value="1"
-                    <?php checked($current_protection['xmlrpc']); ?>>
-                    <label for="protect_xmlrpc">
-        <strong>xmlrpc.php</strong> - защита XML-RPC интерфейса (используется для мобильных приложений)
-    </label>
-    </div>
-    <p class="description">
-        <strong>xmlrpc.php</strong> может использоваться для атак методом перебора паролей.
-        Рекомендуется заблокировать его, если вы не используете мобильные приложения WordPress или внешние сервисы.
-    </p>
+        <?php if (empty($whitelist_ips)) : ?>
+            <p>Белый список пуст.</p>
+        <?php else : ?>
+            <table class="attempts-table">
+                <thead>
+                    <tr>
+                        <th>IP адрес</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($whitelist_ips as $ip) : ?>
+                        <tr>
+                            <td><?php echo esc_html($ip); ?></td>
+                            <td>
+                                <a href="<?php echo wp_nonce_url(
+                                    admin_url('options-general.php?page=advanced-security-blocker&remove_whitelist=' . $ip),
+                                    'remove_whitelist'
+                                ); ?>" class="button" onclick="return confirm('Вы уверены, что хотите удалить этот IP адрес из белого списка?');">
+                                    Удалить
+                                </a>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
     </div>
 
-    <table class="form-table">
-        <tr>
-            <th><label for="login_whitelist_ips">Разрешенные IP:</label></th>
-            <td>
-                <div class="ip-blocker-textarea-wrapper">
-                    <div class="ip-blocker-line-numbers"></div>
-                    <textarea name="login_whitelist_ips" id="login_whitelist_ips" rows="10" cols="50"
-                        class="large-text code" placeholder="<?php echo esc_attr($current_user_ip); ?>&#10;192.168.1.0/24&#10;AS15169"><?php
-                        echo esc_textarea($current_whitelist);
-                    ?></textarea>
-                </div>
-                <p class="description ip-blocker-description">
-                    По одной записи на строку. Поддерживаемые форматы:<br>
-                    • Отдельные IP: <code>192.168.1.100</code><br>
-                    • CIDR диапазоны: <code>192.168.1.0/24</code><br>
-                    • ASN (автономные системы): <code>AS15169</code> или <code>15169</code><br>
-                    • Маска подсети: <code>192.168.1.0 255.255.255.0</code><br>
-                    • Частичные IP: <code>192.168.1</code><br>
-                    <em>ASN автоматически преобразуются в списки разрешенных диапазонов</em>
-                </p>
-            </td>
-        </tr>
-    </table>
+    <div class="card">
+        <h3>Добавить IP в белый список</h3>
+        <form method="post">
+            <?php wp_nonce_field('security_blocker_update'); ?>
+            <table class="form-table">
+                <tr>
+                    <th><label for="whitelist_ip">IP адрес:</label></th>
+                    <td>
+                        <input type="text" name="whitelist_ip" id="whitelist_ip" class="regular-text"
+                            placeholder="192.168.0.1 или 192.168.0.0/24">
+                        <p class="description">Введите IP адрес или CIDR диапазон для добавления в белый список</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th><label for="whitelist_reason">Причина добавления:</label></th>
+                    <td>
+                        <input type="text" name="whitelist_reason" id="whitelist_reason" class="regular-text"
+                            placeholder="Доверенный пользователь">
+                        <p class="description">Укажите причину добавления в белый список</p>
+                    </td>
+                </tr>
+            </table>
+            <p>
+                <button type="submit" name="submit_whitelist" class="button button-primary">
+                    Добавить в белый список
+                </button>
+            </p>
+        </form>
+    </div>
+</div>
+
+<!-- Вкладка статуса -->
+<div id="tab-status" class="security-tab-content">
+    <h2>Статус системы безопасности</h2>
+
+    <div class="cache-settings">
+        <h3>Настройки очистки кеша</h3>
+        <form method="post">
+            <?php wp_nonce_field('security_blocker_update'); ?>
+            <table class="form-table">
+                <tr>
+                    <th><label for="clear_cache_enabled">Автоматическая очистка кеша:</label></th>
+                    <td>
+                        <input type="checkbox" id="clear_cache_enabled" name="clear_cache_enabled" value="1"
+                            <?php checked(get_option('asb_clear_cache_enabled', '1')); ?>>
+                        <label for="clear_cache_enabled">Очищать кеш после изменений настроек</label>
+                        <p class="description">Включает автоматическую очистку различных кешей (OPcache, Redis, Memcached, WordPress) после сохранения изменений в настройках безопасности.</p>
+                    </td>
+                </tr>
+            </table>
+            <p>
+                <button type="submit" name="submit_cache_settings" class="button button-primary">
+                    Сохранить настройки кеша
+                </button>
+            </p>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>Состояние компонентов</h3>
+        <ul>
+            <li>Файл .htaccess: <?php echo is_writable($this->htaccess_path) ?
+                '<span style="color:green">✓ доступен для записи</span>' :
+                '<span style="color:red">✗ недоступен для записи</span>'; ?></li>
+            <li>Резервные копии: <?php echo is_writable($this->backup_dir) ?
+                '<span style="color:green">✓ доступны</span>' :
+                '<span style="color:red">✗ недоступны</span>'; ?></li>
+            <li>Кеш ASN: <?php echo is_writable($this->cache_dir) ?
+                '<span style="color:green">✓ доступен</span>' :
+                '<span style="color:red">✗ недоступен</span>'; ?></li>
+            <li>База данных попыток входа: <?php
+                global $wpdb;
+                $table_exists = $wpdb->get_var("SHOW TABLES LIKE '{$wpdb->prefix}security_login_attempts'");
+                echo $table_exists ?
+                    '<span style="color:green">✓ создана</span>' :
+                    '<span style="color:red">✗ не создана</span>';
+            ?></li>
+            <li>База данных разблокировок: <?php
+                $unblock_table_exists = $wpdb->get_var("SHOW TABLES LIKE '{$wpdb->prefix}security_unblock_history'");
+                echo $unblock_table_exists ?
+                    '<span style="color:green">✓ создана</span>' :
+                    '<span style="color:red">✗ не создана</span>';
+            ?></li>
+            <li>Последняя резервная копия: <?php
+                $backups = glob($this->backup_dir . 'htaccess-*.bak');
+                if (!empty($backups)) {
+                    rsort($backups);
+                    echo '<span style="color:green">' . date('d.m.Y H:i:s', filemtime($backups[0])) . '</span>';
+                } else {
+                    echo '<span style="color:orange">не создана</span>';
+                }
+            ?></li>
+            <li>Кешированные ASN: <?php
+                $cache_files = glob($this->cache_dir . 'asn_*.json');
+                echo '<span style="color:blue">' . count($cache_files) . '</span>';
+            ?></li>
+            <li>Ваш текущий IP: <strong><?php echo esc_html($current_user_ip); ?></strong></li>
+        </ul>
+    </div>
+
+    <div class="card">
+        <h3>Активные защиты</h3>
+        <ul>
+            <li>Блокировка IP: <?php echo !empty($current_ips) ?
+                '<span style="color:green">✓ активна (' . count(array_filter(explode("\n", trim($current_ips)))) . ' записей)</span>' :
+                '<span style="color:gray">○ неактивна</span>'; ?></li>
+            <li>Защита wp-login.php: <?php echo $current_protection['wp_login'] ?
+                '<span style="color:green">✓ активна</span>' :
+                '<span style="color:gray">○ неактивна</span>'; ?></li>
+            <li>Защита xmlrpc.php: <?php echo $current_protection['xmlrpc'] ?
+                '<span style="color:green">✓ активна</span>' :
+                '<span style="color:gray">○ неактивна</span>'; ?></li>
+            <li>Разрешенные IP: <?php echo !empty($current_whitelist) ?
+                '<span style="color:green">' . count(array_filter(explode("\n", trim($current_whitelist)))) . ' записей</span>' :
+                '<span style="color:gray">0 записей</span>'; ?></li>
+            <li>Блокировка файлов: <?php echo !empty($current_files) ?
+                '<span style="color:green">✓ активна (' . count(array_filter(explode("\n", trim($current_files)))) . ' файлов)</span>' :
+                '<span style="color:gray">○ неактивна</span>'; ?></li>
+            <li>Защита от ботов: <?php echo !empty($current_bots) ?
+                '<span style="color:green">✓ активна</span>' :
+                '<span style="color:gray">○ неактивна</span>'; ?></li>
+            <li>Защита от брутфорс атак: <?php echo get_option('asb_brute_force_enabled') ?
+                '<span style="color:green">✓ активна</span>' :
+                '<span style="color:gray">○ неактивна</span>'; ?></li>
+            <li>Белый список: <?php echo !empty($whitelist_ips) ?
+                '<span style="color:green">✓ активен (' . count($whitelist_ips) . ' записей)</span>' :
+                '<span style="color:gray">○ неактивен</span>'; ?></li>
+        </ul>
+    </div>
+
     <p>
-        <button type="submit" name="submit_login_protection" class="button button-primary">
-            Обновить защиту
-        </button>
-        <button type="button" class="button add-my-ip-btn" onclick="addCurrentIP();">
-            Добавить мой IP
-        </button>
+        <a href="<?php echo esc_url(admin_url('options-general.php?page=advanced-security-blocker&backup=1')); ?>"
+           class="button">
+            Создать резервную копию .htaccess
+        </a>
+        <a href="<?php echo esc_url(admin_url('options-general.php?page=advanced-security-blocker&clear_cache=1')); ?>"
+           class="button">
+            Очистить весь кеш
+        </a>
     </p>
-    </form>
-    </div>
+</div>
+</div>
+</div>
 
-    <!-- Вкладка блокировки файлов -->
-    <div id="tab-file-protection" class="security-tab-content">
-        <h2>Блокировка опасных файлов</h2>
-        <div class="security-info">
-            Эта функция блокирует доступ к потенциально опасным файлам. Можно использовать маски файлов (например, *.log для всех .log файлов).
-        </div>
-        <form method="post">
-            <?php wp_nonce_field('security_blocker_update'); ?>
-            <table class="form-table">
-                <tr>
-                    <th><label for="dangerous_files">Заблокированные файлов:</label></th>
-                    <td>
-                        <textarea name="dangerous_files" id="dangerous_files" rows="15" cols="80"
-                            class="simple-textarea" placeholder=".htaccess"><?php
-                            echo esc_textarea($current_files);
-                        ?></textarea>
-                        <p class="description">По одному файлу/маске на строку. Поддерживаются маски с * (например, *.log, *.bak)</p>
-                    </td>
-                </tr>
-            </table>
-            <p>
-                <button type="submit" name="submit_file_protection" class="button button-primary">
-                    Обновить защиту файлов
-                </button>
-            </p>
-        </form>
-    </div>
-
-    <!-- Вкладка защиты от ботов -->
-    <div id="tab-bot-protection" class="security-tab-content">
-        <h2>Блокировка ботов и нежелательных User-Agent</h2>
-        <div class="security-info">
-            Список User-Agent ботов, разделенных символом "|". Частичные и точные User-Agent будут заблокированы.
-        </div>
-        <form method="post">
-            <?php wp_nonce_field('security_blocker_update'); ?>
-            <table class="form-table">
-                <tr>
-                    <th><label for="blocked_bots">Заблокированные User-Agent:</label></th>
-                    <td>
-                        <textarea name="blocked_bots" id="blocked_bots" rows="10" cols="80"
-                            class="simple-textarea" placeholder="BadBot|SpamBot|Crawler"><?php
-                            echo esc_textarea($current_bots);
-                        ?></textarea>
-                        <p class="description">User-Agent строки, разделенные символом "|". Поддерживаются частичные совпадения.</p>
-                    </td>
-                </tr>
-            </table>
-            <p>
-                <button type="submit" name="submit_bot_protection" class="button button-primary">
-                    Обновить защиту от ботов
-                </button>
-            </p>
-        </form>
-    </div>
-
-    <!-- Вкладка защиты от брутфорс атак -->
-    <div id="tab-brute-force" class="security-tab-content">
-        <h2>Защита от брутфорс атак</h2>
-        <div class="brute-force-info">
-            <strong>Автоматическая защита!</strong> Система автоматически блокирует IP адреса при превышении лимита неудачных попыток входа.
-        </div>
-
-        <!-- Статистика -->
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-number" id="stat-total-attempts"><?php echo $login_stats['total_attempts']; ?></div>
-                <div class="stat-label">Попыток входа за 24 часа</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number" id="stat-blocked-ips"><?php echo $login_stats['blocked_ips']; ?></div>
-                <div class="stat-label">Заблокированных IP за 24 часа</div>
-            </div>
-        </div>
-
-        <!-- Настройки -->
-        <form method="post">
-            <?php wp_nonce_field('security_blocker_update'); ?>
-            <!-- Скрытые поля для правильной обработки чекбоксов -->
-            <input type="hidden" name="brute_force_enabled" value="0">
-            <input type="hidden" name="auto_add_to_htaccess" value="0">
-            <input type="hidden" name="email_notifications" value="0">
-
-            <table class="form-table">
-                <tr>
-                    <th><label for="brute_force_enabled">Включить защиту:</label></th>
-                    <td>
-                        <input type="checkbox" id="brute_force_enabled" name="brute_force_enabled" value="1"
-                            <?php checked(get_option('asb_brute_force_enabled')); ?>>
-                        <label for="brute_force_enabled">Автоматически блокировать IP при брутфорс атаках</label>
-                    </td>
-                </tr>
-                <tr>
-                    <th><label for="max_attempts">Максимум попыток:</label></th>
-                    <td>
-                        <input type="number" id="max_attempts" name="max_attempts" min="1" max="50"
-                            value="<?php echo esc_attr(get_option('asb_max_attempts', 5)); ?>">
-                        <p class="description">Количество неудачных попыток входа перед блокировкой</p>
-                    </td>
-                </tr>
-                <tr>
-                    <th><label for="time_window">Временное окно (минуты):</label></th>
-                    <td>
-                        <input type="number" id="time_window" name="time_window" min="1" max="1440"
-                            value="<?php echo esc_attr(get_option('asb_time_window', 15)); ?>">
-                        <p class="description">Период времени для подсчёта попыток входа</p>
-                    </td>
-                </tr>
-                <tr>
-                    <th><label for="block_duration">Длительность блокировки (минуты):</label></th>
-                    <td>
-                        <input type="number" id="block_duration" name="block_duration" min="0" max="10080"
-                            value="<?php echo esc_attr(get_option('asb_block_duration', 60)); ?>">
-                        <p class="description">0 = постоянная блокировка (требует ручного разблокирования)</p>
-                    </td>
-                </tr>
-                <tr>
-                    <th><label for="auto_add_to_htaccess">Добавлять в .htaccess:</label></th>
-                    <td>
-                        <input type="checkbox" id="auto_add_to_htaccess" name="auto_add_to_htaccess" value="1"
-                            <?php checked(get_option('asb_auto_add_to_htaccess')); ?>>
-                        <label for="auto_add_to_htaccess">Автоматически добавлять заблокированные IP в .htaccess</label>
-                        <p class="description">Если отключено, блокировка будет работать только на уровне WordPress</p>
-                    </td>
-                </tr>
-                <tr>
-                    <th><label for="email_notifications">Email уведомления:</label></th>
-                    <td>
-                        <input type="checkbox" id="email_notifications" name="email_notifications" value="1"
-                            <?php checked(get_option('asb_email_notifications')); ?>>
-                        <label for="email_notifications">Отправлять уведомления администратору о блокировках</label>
-                    </td>
-                </tr>
-            </table>
-            <p>
-                <button type="submit" name="submit_brute_force_protection" class="button button-primary">
-                    Сохранить настройки
-                </button>
-                <button type="submit" name="cleanup_attempts" class="button"
-                    onclick="return confirm('Удалить все старые записи попыток входа?');">
-                    Очистить старые записи
-                </button>
-            </p>
-        </form>
-
-        <!-- Контролы обновления -->
-        <div class="auto-refresh-controls">
-            <label>
-                <input type="checkbox" id="auto-refresh-stats" checked>
-                Автоматическое обновление каждые 30 секунд
-            </label>
-            <button id="manual-refresh-stats" class="refresh-button">Обновить сейчас</button>
-            <span id="last-updated">Последнее обновление: <?php echo date('H:i:s'); ?></span>
-        </div>
-
-        <!-- Топ IP по попыткам -->
-        <div id="top-ips-container">
-            <h3>Топ IP адресов по попыток входа (24 часа)</h3>
-            <table class="attempts-table">
-                <thead>
-                    <tr>
-                        <th>IP адрес</th>
-                        <th>Попыток</th>
-                        <th>Статус</th>
-                    </tr>
-                </thead>
-                <tbody id="top-ips-body">
-                    <?php foreach ($login_stats['top_ips'] as $ip_stat) : ?>
-                        <tr>
-                            <td><?php echo esc_html($ip_stat->ip_address); ?></td>
-                            <td><?php echo esc_html($ip_stat->attempts); ?></td>
-                            <td>
-                                <?php if ($ip_stat->is_blocked) : ?>
-                                    <span class="blocked-ip">Заблокирован</span>
-                                <?php else : ?>
-                                    <span class="normal-ip">Активен</span>
-                                <?php endif; ?>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        </div>
-
-        <!-- Последние попытки входа -->
-        <div id="recent-attempts-container">
-            <h3>Последние попытки входа</h3>
-            <table class="attempts-table">
-                <thead>
-                    <tr>
-                        <th>Время</th>
-                        <th>IP адрес</th>
-                        <th>Пользователь</th>
-                        <th>Статус</th>
-                        <th>User-Agent</th>
-                    </tr>
-                </thead>
-                <tbody id="recent-attempts-body">
-                    <?php foreach ($login_stats['recent_attempts'] as $attempt) : ?>
-                        <tr>
-                            <td><?php echo esc_html(date('d.m.Y H:i:s', strtotime($attempt->attempt_time))); ?></td>
-                            <td><?php echo esc_html($attempt->ip_address); ?></td>
-                            <td><?php echo esc_html($attempt->username); ?></td>
-                            <td>
-                                <?php if ($attempt->blocked) : ?>
-                                    <span class="blocked-ip">Заблокирован</span>
-                                <?php else : ?>
-                                    <span class="normal-ip">Неудачная попытка</span>
-                                <?php endif; ?>
-                            </td>
-                            <td title="<?php echo esc_attr($attempt->user_agent); ?>">
-                                <?php echo esc_html(substr($attempt->user_agent, 0, 50)) . (strlen($attempt->user_agent) > 50 ? '...' : ''); ?>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
+<!-- Модальное окно для истории блокировок -->
+<div id="history-modal" class="modal">
+    <div class="modal-content">
+        <span class="close">&times;</span>
+        <h2>История блокировок для IP: <span id="modal-ip"></span></h2>
+        <div id="modal-history-content">
+            <p>Загрузка истории...</p>
         </div>
     </div>
+</div>
 
-    <!-- Вкладка управления блокировками -->
-    <div id="tab-manage-blocks" class="security-tab-content">
-        <h2>Управление заблокированными IP адресами</h2>
+<script>
+jQuery(document).ready(function($) {
+    // Функция для обновления нумерации строк в textarea
+    function updateLineNumbers(textarea, lineNumbers) {
+        var lines = textarea.value.split('\n').length;
+        var numbersText = '';
+        
+        for (var i = 1; i <= lines; i++) {
+            numbersText += i + '\n';
+        }
+        
+        lineNumbers.textContent = numbersText;
+        
+        // Синхронизируем прокрутку
+        lineNumbers.scrollTop = textarea.scrollTop;
+    }
+    
+    // Инициализация нумерации строк
+    $('.ip-blocker-textarea-wrapper').each(function() {
+        var wrapper = $(this);
+        var textarea = wrapper.find('textarea')[0];
+        var lineNumbers = wrapper.find('.ip-blocker-line-numbers')[0];
+        
+        if (textarea && lineNumbers) {
+            // Инициализация при загрузке
+            updateLineNumbers(textarea, lineNumbers);
+            
+            // Обновление при изменении текста
+            textarea.addEventListener('input', function() {
+                updateLineNumbers(textarea, lineNumbers);
+            });
+            
+            // Синхронизация прокрутки
+            textarea.addEventListener('scroll', function() {
+                lineNumbers.scrollTop = textarea.scrollTop;
+            });
+        }
+    });
 
-        <div class="security-info">
-            На этой странице вы можете управлять всеми заблокированными IP адресами.
-            Вы можете разблокировать IP адреса, которые были заблокированы автоматически или вручную.
-        </div>
+    // Функция переключения вкладки
+    function showTab(tabId) {
+        var contents = document.querySelectorAll('.security-tab-content');
+        var buttons = document.querySelectorAll('.security-tab-nav button');
 
-        <!-- Поиск по IP -->
-        <div class="card">
-            <h3>Поиск по IP адресам</h3>
-            <form method="get">
-                <input type="hidden" name="page" value="advanced-security-blocker">
-                <input type="hidden" name="tab" value="manage-blocks">
-                <table class="form-table">
-                    <tr>
-                        <th><label for="ip-search">Поиск IP:</label></th>
-                        <td>
-                            <input type="text" id="ip-search" name="s" value="<?php echo esc_attr($search); ?>"
-                                class="regular-text" placeholder="Введите IP адрес для поиска">
-                            <button type="submit" class="button">Поиск</button>
-                            <?php if (!empty($search)) : ?>
-                                <a href="<?php echo admin_url('options-general.php?page=advanced-security-blocker&tab=manage-blocks'); ?>" class="button">Сбросить</a>
-                            <?php endif; ?>
-                        </td>
-                    </tr>
-                </table>
-            </form>
-        </div>
+        contents.forEach(function(content) {
+            content.classList.remove('active');
+            content.style.display = 'none';
+        });
 
-        <div class="card">
-            <h3>Заблокированные IP адреса</h3>
+        buttons.forEach(function(button) {
+            button.classList.remove('active');
+        });
 
-            <?php if (empty($blocks_to_show)) : ?>
-                <p>Нет заблокированных IP адресов.</p>
-            <?php else : ?>
-                <!-- Пагинация -->
-                <div class="tablenav top">
-                    <div class="tablenav-pages">
-                        <span class="displaying-num"><?php echo $total_blocks; ?> элементов</span>
-                        <?php if ($total_pages > 1) : ?>
-                            <span class="pagination-links">
-                                <?php if ($current_page > 1) : ?>
-                                    <a class="first-page button" href="<?php echo add_query_arg('paged', 1); ?>">«</a>
-                                    <a class="prev-page button" href="<?php echo add_query_arg('paged', $current_page - 1); ?>">‹</a>
-                                <?php endif; ?>
+        var targetTab = document.getElementById(tabId);
+        var targetButton = document.querySelector('.security-tab-nav button[data-tab="' + tabId + '"]');
 
-                                <span class="paging-input">
-                                    <span class="current-page"><?php echo $current_page; ?></span> из
-                                    <span class="total-pages"><?php echo $total_pages; ?></span>
-                                </span>
+        if (targetTab) {
+            targetTab.classList.add('active');
+            targetTab.style.display = 'block';
+        }
 
-                                <?php if ($current_page < $total_pages) : ?>
-                                    <a class="next-page button" href="<?php echo add_query_arg('paged', $current_page + 1); ?>">›</a>
-                                    <a class="last-page button" href="<?php echo add_query_arg('paged', $total_pages); ?>">»</a>
-                                <?php endif; ?>
-                            </span>
-                        <?php endif; ?>
-                    </div>
-                </div>
+        if (targetButton) {
+            targetButton.classList.add('active');
+        }
+        
+        // Управление автообновлением статистики
+        setupAutoRefresh();
+    }
 
-                <table class="attempts-table">
-                    <thead>
-                        <tr>
-                            <th>IP адрес</th>
-                            <th>Тип блокировки</th>
-                            <th>Последняя попытка</th>
-                            <th>Действия</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($blocks_to_show as $block) : ?>
-                            <tr>
-                                <td><?php echo esc_html($block['ip']); ?></td>
-                                <td>
-                                    <?php
-                                    $type_labels = [
-                                        'temporary' => '<span style="color: orange;">Временная</span>',
-                                        'permanent' => '<span style="color: red;">Постоянная</span>',
-                                        'htaccess' => '<span style="color: purple;">Через .htaccess</span>'
-                                    ];
-                                    echo $type_labels[$block['type']];
-                                    ?>
-                                </td>
-                                <td><?php echo esc_html($block['last_attempt']); ?></td>
-                                <td>
-                                    <a href="<?php echo wp_nonce_url(
-                                        admin_url('options-general.php?page=advanced-security-blocker&unblock_ip=' . $block['ip'] . '&tab=manage-blocks&paged=' . $current_page . '&s=' . urlencode($search)),
-                                        'unblock_ip'
-                                    ); ?>" class="button" onclick="return confirm('Вы уверены, что хотите разблокировать этот IP адрес?');">
-                                        Разблокировать
-                                    </a>
-                                    <button class="button view-history-btn" data-ip="<?php echo esc_attr($block['ip']); ?>">
-                                        История
-                                    </button>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
+    // Обработчики кликов по кнопкам вкладок
+    var tabButtons = document.querySelectorAll('.security-tab-nav button');
+    tabButtons.forEach(function(button) {
+        button.addEventListener('click', function(e) {
+            e.preventDefault();
+            var tabId = this.getAttribute('data-tab');
+            showTab(tabId);
+            
+            // Если переключились на вкладку управления блокировками, загружаем таблицу
+            if (tabId === 'tab-manage-blocks') {
+                setTimeout(function() {
+                    loadBlockedIPsTable(1, $('#ip-search').val());
+                }, 100);
+            }
+        });
+    });
 
-                <!-- Пагинация внизу -->
-                <div class="tablenav bottom">
-                    <div class="tablenav-pages">
-                        <span class="displaying-num"><?php echo $total_blocks; ?> элементов</span>
-                        <?php if ($total_pages > 1) : ?>
-                            <span class="pagination-links">
-                                <?php if ($current_page > 1) : ?>
-                                    <a class="first-page button" href="<?php echo add_query_arg('paged', 1); ?>">«</a>
-                                    <a class="prev-page button" href="<?php echo add_query_arg('paged', $current_page - 1); ?>">‹</a>
-                                <?php endif; ?>
+    // Показываем первую вкладку по умолчанию
+    showTab("tab-ip-blocking");
 
-                                <span class="paging-input">
-                                    <span class="current-page"><?php echo $current_page; ?></span> из
-                                    <span class="total-pages"><?php echo $total_pages; ?></span>
-                                </span>
+    // AJAX обновление статистики брутфорс атак
+    var statsRefreshInterval = null;
 
-                                <?php if ($current_page < $total_pages) : ?>
-                                    <a class="next-page button" href="<?php echo add_query_arg('paged', $current_page + 1); ?>">›</a>
-                                    <a class="last-page button" href="<?php echo add_query_arg('paged', $total_pages); ?>">»</a>
-                                <?php endif; ?>
-                            </span>
-                        <?php endif; ?>
-                    </div>
-                </div>
-            <?php endif; ?>
-        </div>
+    function updateBruteForceStats() {
+        var refreshButton = $('#manual-refresh-stats');
+        var lastUpdated = $('#last-updated');
 
-        <div class="card">
-            <h3>История разблокировок</h3>
+        if (refreshButton.length) refreshButton.prop('disabled', true);
+        if (lastUpdated.length) lastUpdated.html('<span class="loading-spinner"></span> Обновление...');
 
-            <?php if (empty($unblock_history)) : ?>
-                <p>Нет записей в истории разблокировок.</p>
-            <?php else : ?>
-                <table class="attempts-table">
-                    <thead>
-                        <tr>
-                            <th>IP адрес</th>
-                            <th>Время разблокировки</th>
-                            <th>Причина</th>
-                            <th>Кем разблокирован</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($unblock_history as $unblock) : ?>
-                            <tr>
-                                <td><?php echo esc_html($unblock->ip_address); ?></td>
-                                <td><?php echo esc_html(date('d.m.Y H:i:s', strtotime($unblock->unblock_time))); ?></td>
-                                <td><?php echo esc_html($unblock->unblock_reason); ?></td>
-                                <td><?php echo esc_html($unblock->unblocked_by); ?></td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            <?php endif; ?>
-        </div>
+        $.ajax({
+            url: asb_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'asb_get_login_stats',
+                nonce: asb_ajax.nonce
+            },
+            success: function(response) {
+                if (response.success) {
+                    var data = response.data;
 
-        <div class="card">
-            <h3>Добавить IP в черный список</h3>
-            <form method="post">
-                <?php wp_nonce_field('security_blocker_update'); ?>
-                <table class="form-table">
-                    <tr>
-                        <th><label for="manual_block_ip">IP адрес:</label></th>
-                        <td>
-                            <input type="text" name="manual_block_ip" id="manual_block_ip" class="regular-text"
-                                placeholder="192.168.0.1 или 192.168.0.0/24">
-                            <p class="description">Введите IP адрес или CIDR диапазон для блокировки</p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th><label for="block_reason">Причина блокировки:</label></th>
-                        <td>
-                            <input type="text" name="block_reason" id="block_reason" class="regular-text"
-                                placeholder="Нежелательный трафик">
-                            <p class="description">Укажите причину блокировки для ведения лога</p>
-                        </td>
-                    </tr>
-                </table>
-                <p>
-                    <button type="submit" name="submit_manual_block" class="button button-primary">
-                        Заблокировать IP
-                    </button>
-                </p>
-            </form>
-        </div>
-    </div>
+                    // Обновляем общую статистику
+                    $('#stat-total-attempts').text(data.total_attempts);
+                    $('#stat-blocked-ips').text(data.blocked_ips);
 
-    <!-- Вкладка белого списка -->
-    <div id="tab-whitelist" class="security-tab-content">
-        <h2>Белый список IP адресов</h2>
-
-        <div class="security-info">
-            IP адреса в белом списке никогда не будут заблокированы системой, даже при множественных неудачных попыток входа.
-        </div>
-
-        <div class="card">
-            <h3>Текущий белый список</h3>
-
-            <?php if (empty($whitelist_ips)) : ?>
-                <p>Белый список пуст.</p>
-            <?php else : ?>
-                <table class="attempts-table">
-                    <thead>
-                        <tr>
-                            <th>IP адрес</th>
-                            <th>Действия</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($whitelist_ips as $ip) : ?>
-                            <tr>
-                                <td><?php echo esc_html($ip); ?></td>
-                                <td>
-                                    <a href="<?php echo wp_nonce_url(
-                                        admin_url('options-general.php?page=advanced-security-blocker&remove_whitelist=' . $ip),
-                                        'remove_whitelist'
-                                    ); ?>" class="button" onclick="return confirm('Вы уверены, что хотите удалить этот IP адрес из белого списка?');">
-                                        Удалить
-                                    </a>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            <?php endif; ?>
-        </div>
-
-        <div class="card">
-            <h3>Добавить IP в белый список</h3>
-            <form method="post">
-                <?php wp_nonce_field('security_blocker_update'); ?>
-                <table class="form-table">
-                    <tr>
-                        <th><label for="whitelist_ip">IP адрес:</label></th>
-                        <td>
-                            <input type="text" name="whitelist_ip" id="whitelist_ip" class="regular-text"
-                                placeholder="192.168.0.1 или 192.168.0.0/24">
-                            <p class="description">Введите IP адрес или CIDR диапазон для добавления в белый список</p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th><label for="whitelist_reason">Причина добавления:</label></th>
-                        <td>
-                            <input type="text" name="whitelist_reason" id="whitelist_reason" class="regular-text"
-                                placeholder="Доверенный пользователь">
-                            <p class="description">Укажите причину добавления в белый список</p>
-                        </td>
-                    </tr>
-                </table>
-                <p>
-                    <button type="submit" name="submit_whitelist" class="button button-primary">
-                        Добавить в белый список
-                    </button>
-                </p>
-            </form>
-        </div>
-    </div>
-
-    <!-- Вкладка статуса -->
-    <div id="tab-status" class="security-tab-content">
-        <h2>Статус системы безопасности</h2>
-        <div class="card">
-            <h3>Состояние компонентов</h3>
-            <ul>
-                <li>Файл .htaccess: <?php echo is_writable($this->htaccess_path) ?
-                    '<span style="color:green">✓ доступен для записи</span>' :
-                    '<span style="color:red">✗ недоступен для записи</span>'; ?></li>
-                <li>Резервные копии: <?php echo is_writable($this->backup_dir) ?
-                    '<span style="color:green">✓ доступны</span>' :
-                    '<span style="color:red">✗ недоступны</span>'; ?></li>
-                <li>Кеш ASN: <?php echo is_writable($this->cache_dir) ?
-                    '<span style="color:green">✓ доступен</span>' :
-                    '<span style="color:red">✗ недоступен</span>'; ?></li>
-                <li>База данных попыток входа: <?php
-                    global $wpdb;
-                    $table_exists = $wpdb->get_var("SHOW TABLES LIKE '{$wpdb->prefix}security_login_attempts'");
-                    echo $table_exists ?
-                        '<span style="color:green">✓ создана</span>' :
-                        '<span style="color:red">✗ не создана</span>';
-                ?></li>
-                <li>База данных разблокировок: <?php
-                    $unblock_table_exists = $wpdb->get_var("SHOW TABLES LIKE '{$wpdb->prefix}security_unblock_history'");
-                    echo $unblock_table_exists ?
-                        '<span style="color:green">✓ создана</span>' :
-                        '<span style="color:red">✗ не создана</span>';
-                ?></li>
-                <li>Последняя резервная копия: <?php
-                    $backups = glob($this->backup_dir . 'htaccess-*.bak');
-                    if (!empty($backups)) {
-                        rsort($backups);
-                        echo '<span style="color:green">' . date('d.m.Y H:i:s', filemtime($backups[0])) . '</span>';
+                    // Обновляем топ IP
+                    var topIpsHtml = '';
+                    if (data.top_ips && data.top_ips.length) {
+                        data.top_ips.forEach(function(ip) {
+                            topIpsHtml += '<tr>' +
+                                '<td>' + ip.ip_address + '</td>' +
+                                '<td>' + ip.attempts + '</td>' +
+                                '<td>' + (ip.is_blocked ? '<span class="blocked-ip">Заблокирован</span>' : '<span class="normal-ip">Активен</span>') + '</td>' +
+                            '</tr>';
+                        });
                     } else {
-                        echo '<span style="color:orange">не создана</span>';
+                        topIpsHtml = '<tr><td colspan="3">Нет данных</td></tr>';
                     }
-                ?></li>
-                <li>Кешированные ASN: <?php
-                    $cache_files = glob($this->cache_dir . 'asn_*.json');
-                    echo '<span style="color:blue">' . count($cache_files) . '</span>';
-                ?></li>
-                <li>Ваш текущий IP: <strong><?php echo esc_html($current_user_ip); ?></strong></li>
-            </ul>
-        </div>
+                    $('#top-ips-body').html(topIpsHtml);
 
-        <div class="card">
-            <h3>Активные защиты</h3>
-            <ul>
-                <li>Блокировка IP: <?php echo !empty($current_ips) ?
-                    '<span style="color:green">✓ активна (' . count(array_filter(explode("\n", trim($current_ips)))) . ' записей)</span>' :
-                    '<span style="color:gray">○ неактивна</span>'; ?></li>
-                <li>Защита wp-login.php: <?php echo $current_protection['wp_login'] ?
-                    '<span style="color:green">✓ активна</span>' :
-                    '<span style="color:gray">○ неактивна</span>'; ?></li>
-                <li>Защита xmlrpc.php: <?php echo $current_protection['xmlrpc'] ?
-                    '<span style="color:green">✓ активна</span>' :
-                    '<span style="color:gray">○ неактивна</span>'; ?></li>
-                <li>Разрешенные IP: <?php echo !empty($current_whitelist) ?
-                    '<span style="color:green">' . count(array_filter(explode("\n", trim($current_whitelist)))) . ' записей</span>' :
-                    '<span style="color:gray">0 записей</span>'; ?></li>
-                <li>Блокировка файлов: <?php echo !empty($current_files) ?
-                    '<span style="color:green">✓ активна (' . count(array_filter(explode("\n", trim($current_files)))) . ' файлов)</span>' :
-                    '<span style="color:gray">○ неактивна</span>'; ?></li>
-                <li>Защита от ботов: <?php echo !empty($current_bots) ?
-                    '<span style="color:green">✓ активна</span>' :
-                    '<span style="color:gray">○ неактивна</span>'; ?></li>
-                <li>Защита от брутфорс атак: <?php echo get_option('asb_brute_force_enabled') ?
-                    '<span style="color:green">✓ активна</span>' :
-                    '<span style="color:gray">○ неактивна</span>'; ?></li>
-                <li>Белый список: <?php echo !empty($whitelist_ips) ?
-                    '<span style="color:green">✓ активен (' . count($whitelist_ips) . ' записей)</span>' :
-                    '<span style="color:gray">○ неактивен</span>'; ?></li>
-            </ul>
-        </div>
+                    // Обновляем последние попытки
+                    var recentHtml = '';
+                    if (data.recent_attempts && data.recent_attempts.length) {
+                        data.recent_attempts.forEach(function(attempt) {
+                            var date = new Date(attempt.attempt_time);
+                            recentHtml += '<tr>' +
+                                '<td>' + date.toLocaleString() + '</td>' +
+                                '<td>' + attempt.ip_address + '</td>' +
+                                '<td>' + attempt.username + '</td>' +
+                                '<td>' + (attempt.blocked ? '<span class="blocked-ip">Заблокирован</span>' : '<span class="normal-ip">Неудачная попытка</span>') + '</td>' +
+                                '<td title="' + (attempt.user_agent || '') + '">' +
+                                    (attempt.user_agent ? (attempt.user_agent.substring(0, 50) + (attempt.user_agent.length > 50 ? '...' : '')) : '') +
+                                '</td>' +
+                            '</tr>';
+                        });
+                    } else {
+                        recentHtml = '<tr><td colspan="5">Нет данных</td></tr>';
+                    }
+                    $('#recent-attempts-body').html(recentHtml);
 
-        <p>
-            <a href="<?php echo esc_url(admin_url('options-general.php?page=advanced-security-blocker&backup=1')); ?>"
-               class="button">
-                Создать резервную копию .htaccess
-            </a>
-            <a href="<?php echo esc_url(admin_url('options-general.php?page=advanced-security-blocker&clear_cache=1')); ?>"
-               class="button">
-                Очистить весь кеш
-            </a>
-        </p>
-    </div>
-    </div>
-    </div>
+                    // Обновляем время последнего обновления
+                    var now = new Date();
+                    if (lastUpdated.length) lastUpdated.text('Последнее обновление: ' + now.toLocaleTimeString());
+                }
+            },
+            error: function(xhr, status, error) {
+                console.error('Ошибка при обновлении статистики:', error);
+                if (lastUpdated.length) lastUpdated.text('Ошибка обновления');
+            },
+            complete: function() {
+                if (refreshButton.length) refreshButton.prop('disabled', false);
+            }
+        });
+    }
 
-    <!-- Модальное окно для истории блокировок -->
-    <div id="history-modal" class="modal">
-        <div class="modal-content">
-            <span class="close">&times;</span>
-            <h2>История блокировок для IP: <span id="modal-ip"></span></h2>
-            <div id="modal-history-content">
-                <p>Загрузка истории...</p>
-            </div>
-        </div>
-    </div>
-
-    <script>
-    function addCurrentIP() {
-        var textarea = document.getElementById('login_whitelist_ips');
-        var currentIP = '<?php echo esc_js($current_user_ip); ?>';
-        if (textarea && textarea.value.indexOf(currentIP) === -1) {
-            textarea.value += (textarea.value ? '\n' : '') + currentIP;
+    // Функция настройки автообновления
+    function setupAutoRefresh() {
+        clearInterval(statsRefreshInterval);
+        
+        // Запускаем автообновление только если:
+        // 1. Чекбокс отмечен
+        // 2. Активна вкладка с брутфорс защитой
+        if ($('#auto-refresh-stats').is(':checked') && $('#tab-brute-force').is(':visible')) {
+            statsRefreshInterval = setInterval(updateBruteForceStats, 30000); // 30 секунд
         }
     }
 
-    // Инициализация после загрузки DOM
-    document.addEventListener('DOMContentLoaded', function() {
-        // Функция переключения вкладки
-        function showTab(tabId) {
-            var contents = document.querySelectorAll('.security-tab-content');
-            var buttons = document.querySelectorAll('.security-tab-nav button');
+    // Обработчики для ручного и автоматического обновления
+    var manualRefreshBtn = $('#manual-refresh-stats');
+    var autoRefreshCheckbox = $('#auto-refresh-stats');
 
-            contents.forEach(function(content) {
-                content.classList.remove('active');
-                content.style.display = 'none';
-            });
-
-            buttons.forEach(function(button) {
-                button.classList.remove('active');
-            });
-
-            var targetTab = document.getElementById(tabId);
-            var targetButton = document.querySelector('.security-tab-nav button[data-tab="' + tabId + '"]');
-
-            if (targetTab) {
-                targetTab.classList.add('active');
-                targetTab.style.display = 'block';
-            }
-
-            if (targetButton) {
-                targetButton.classList.add('active');
-            }
-        }
-
-        // Обработчики кликов по кнопкам вкладок
-        var tabButtons = document.querySelectorAll('.security-tab-nav button');
-        tabButtons.forEach(function(button) {
-            button.addEventListener('click', function(e) {
-                e.preventDefault();
-                var tabId = this.getAttribute('data-tab');
-                showTab(tabId);
-            });
+    if (manualRefreshBtn.length) {
+        manualRefreshBtn.on('click', function() {
+            updateBruteForceStats();
         });
+    }
 
-        // Показываем первую вкладку по умолчанию
-        showTab("tab-ip-blocking");
+    if (autoRefreshCheckbox.length) {
+        autoRefreshCheckbox.on('change', function() {
+            if (this.checked) {
+                // При включении сразу обновляем данные
+                updateBruteForceStats();
+            }
+            setupAutoRefresh();
+        });
+        
+        // Инициализируем автообновление если чекбокс отмечен
+        if (autoRefreshCheckbox.is(':checked') && $('#tab-brute-force').is(':visible')) {
+            setupAutoRefresh();
+            updateBruteForceStats();
+        }
+    }
 
-        // Настройка номеров строк для textarea
-        function setupLineNumbers(wrapper) {
-            var textarea = wrapper.querySelector('textarea');
-            var lineNumbersDiv = wrapper.querySelector('.ip-blocker-line-numbers');
+    // AJAX-пагинация для таблицы заблокированных IP
+    function loadBlockedIPsTable(page = 1, search = '') {
+        var container = $('#blocked-ips-table-container');
+        var loadingIndicator = $('<div class="loading-spinner" style="text-align: center; margin: 20px;"></div>');
+        
+        container.html(loadingIndicator);
+        
+        $.ajax({
+            url: asb_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'asb_get_blocked_ips_table',
+                nonce: asb_ajax.nonce,
+                page: page,
+                search: search
+            },
+            success: function(response) {
+                if (response.success) {
+                    container.html(response.data.table_html);
+                    
+                    // Добавляем обработчики событий для пагинации
+                    container.find('.pagination-links a').on('click', function(e) {
+                        e.preventDefault();
+                        var page = $(this).data('page');
+                        loadBlockedIPsTable(page, search);
+                    });
+                    
+                    // Добавляем обработчики для кнопок просмотра истории
+                    container.find('.view-history-btn').on('click', function() {
+                        var ip = $(this).data('ip');
+                        showBlockHistory(ip);
+                    });
+                } else {
+                    container.html('<p>Ошибка загрузки данных.</p>');
+                }
+            },
+            error: function() {
+                container.html('<p>Ошибка загрузки данных.</p>');
+            }
+        });
+    }
+    
+    // Обработка поиска
+    $('#ip-search-form').on('submit', function(e) {
+        e.preventDefault();
+        var search = $('#ip-search').val();
+        loadBlockedIPsTable(1, search);
+    });
+    
+    // Обработка сброса поиска
+    $('#reset-search').on('click', function(e) {
+        e.preventDefault();
+        $('#ip-search').val('');
+        loadBlockedIPsTable(1, '');
+    });
+    
+    // Инициализация при загрузке вкладки управления блокировками
+    if ($('#tab-manage-blocks').is(':visible')) {
+        loadBlockedIPsTable(1, $('#ip-search').val());
+    }
 
-            if (!textarea || !lineNumbersDiv) return;
+    // Модальное окно для истории блокировок
+    var modal = document.getElementById('history-modal');
+    var span = document.getElementsByClassName('close')[0];
+    var modalIp = document.getElementById('modal-ip');
+    var modalContent = document.getElementById('modal-history-content');
 
-            function updateLineNumbers() {
-                var text = textarea.value;
-                var lines = text ? text.split('\n').length : 1;
-                var lineNumbers = '';
-
-                for (var i = 1; i <= lines; i++) {
-                    lineNumbers += i + (i < lines ? '\n' : '');
-                  }
-
-lineNumbersDiv.textContent = lineNumbers;
-}
-
-textarea.addEventListener('input', updateLineNumbers);
-textarea.addEventListener('keyup', updateLineNumbers);
-textarea.addEventListener('paste', updateLineNumbers);
-textarea.addEventListener('scroll', function() {
-lineNumbersDiv.scrollTop = textarea.scrollTop;
-});
-
-updateLineNumbers();
-}
-
-// Инициализация нумерации строк
-var wrappers = document.querySelectorAll('.ip-blocker-textarea-wrapper');
-wrappers.forEach(setupLineNumbers);
-
-// AJAX обновление статистики брутфорс атак
-var autoRefreshEnabled = true;
-var refreshInterval;
-
-function updateBruteForceStats() {
-var refreshButton = document.getElementById('manual-refresh-stats');
-var lastUpdated = document.getElementById('last-updated');
-
-if (refreshButton) refreshButton.disabled = true;
-if (lastUpdated) lastUpdated.innerHTML = '<span class="loading-spinner"></span> Обновление...';
-
-jQuery.ajax({
-url: asb_ajax.ajax_url,
-type: 'POST',
-data: {
-  action: 'asb_get_login_stats',
-  nonce: asb_ajax.nonce
-},
-success: function(response) {
-  if (response.success) {
-      var data = response.data;
-
-      // Обновляем общую статистику
-      document.getElementById('stat-total-attempts').textContent = data.total_attempts;
-      document.getElementById('stat-blocked-ips').textContent = data.blocked_ips;
-
-      // Обновляем топ IP
-      var topIpsHtml = '';
-      data.top_ips.forEach(function(ip) {
-          topIpsHtml += '<tr>' +
-              '<td>' + ip.ip_address + '</td>' +
-              '<td>' + ip.attempts + '</td>' +
-              '<td>' + (ip.is_blocked ? '<span class="blocked-ip">Заблокирован</span>' : '<span class="normal-ip">Активен</span>') + '</td>' +
-          '</tr>';
-      });
-      document.getElementById('top-ips-body').innerHTML = topIpsHtml;
-
-      // Обновляем последние попытки
-      var recentHtml = '';
-      data.recent_attempts.forEach(function(attempt) {
-          var date = new Date(attempt.attempt_time);
-          recentHtml += '<tr>' +
-              '<td>' + date.toLocaleString() + '</td>' +
-              '<td>' + attempt.ip_address + '</td>' +
-              '<td>' + attempt.username + '</td>' +
-              '<td>' + (attempt.blocked ? '<span class="blocked-ip">Заблокирован</span>' : '<span class="normal-ip">Неудачная попытка</span>') + '</td>' +
-              '<td title="' + (attempt.user_agent || '') + '">' +
-                  (attempt.user_agent ? (attempt.user_agent.substring(0, 50) + (attempt.user_agent.length > 50 ? '...' : '')) : '') +
-              '</td>' +
-          '</tr>';
-      });
-      document.getElementById('recent-attempts-body').innerHTML = recentHtml;
-
-      // Обновляем время последнего обновления
-      var now = new Date();
-      if (lastUpdated) lastUpdated.textContent = 'Последнее обновление: ' + now.toLocaleTimeString();
-  }
-},
-error: function(xhr, status, error) {
-  console.error('Ошибка при обновлении статистики:', error);
-  if (lastUpdated) lastUpdated.textContent = 'Ошибка обновления';
-},
-complete: function() {
-  if (refreshButton) refreshButton.disabled = false;
-}
-});
-}
-
-// Обработчики для ручного и автоматического обновления
-var manualRefreshBtn = document.getElementById('manual-refresh-stats');
-var autoRefreshCheckbox = document.getElementById('auto-refresh-stats');
-
-if (manualRefreshBtn) {
-manualRefreshBtn.addEventListener('click', updateBruteForceStats);
-}
-
-if (autoRefreshCheckbox) {
-autoRefreshCheckbox.addEventListener('change', function() {
-autoRefreshEnabled = this.checked;
-if (autoRefreshEnabled) {
-  startAutoRefresh();
-} else {
-  clearInterval(refreshInterval);
-}
-});
-}
-
-function startAutoRefresh() {
-clearInterval(refreshInterval);
-refreshInterval = setInterval(updateBruteForceStats, 30000); // 30 секунд
-}
-
-// Запускаем автоматическое обновление если на вкладке брутфорс атак
-if (document.getElementById('tab-brute-force').style.display !== 'none') {
-    startAutoRefresh();
-    updateBruteForceStats();
-}
-
-// Модальное окно для истории блокировок
-var modal = document.getElementById('history-modal');
-var span = document.getElementsByClassName('close')[0];
-var modalIp = document.getElementById('modal-ip');
-var modalContent = document.getElementById('modal-history-content');
-
-// Обработчик для кнопок просмотра истории
-document.querySelectorAll('.view-history-btn').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-        var ip = this.getAttribute('data-ip');
+    function showBlockHistory(ip) {
         modalIp.textContent = ip;
         modalContent.innerHTML = '<p>Загрузка истории...</p>';
         modal.style.display = 'block';
 
-        jQuery.ajax({
+        $.ajax({
             url: asb_ajax.ajax_url,
             type: 'POST',
             data: {
@@ -2613,50 +2927,64 @@ document.querySelectorAll('.view-history-btn').forEach(function(btn) {
                 modalContent.innerHTML = '<p>Ошибка загрузки истории.</p>';
             }
         });
-    });
-});
-
-// Закрытие модального окна
-span.onclick = function() {
-    modal.style.display = 'none';
-}
-
-window.onclick = function(event) {
-    if (event.target == modal) {
-        modal.style.display = 'none';
     }
-}
-});
 
-// Исправление обработки чекбоксов
-document.addEventListener('DOMContentLoaded', function() {
-// Обработчик для всех чекбоксов в форме защиты от брутфорс атак
-var bruteForceForm = document.querySelector('form input[name="submit_brute_force_protection"]');
-if (bruteForceForm) {
-    var form = bruteForceForm.closest('form');
-    var checkboxes = form.querySelectorAll('input[type="checkbox"]');
+    // Обработчик для кнопок просмотра истории
+    $(document).on('click', '.view-history-btn', function() {
+        var ip = $(this).data('ip');
+        showBlockHistory(ip);
+    });
 
-    checkboxes.forEach(function(checkbox) {
-        // Убираем скрытые поля при отправке если чекбокс отмечен
-        checkbox.addEventListener('change', function() {
-            var hiddenField = form.querySelector('input[type="hidden"][name="' + this.name + '"]');
-            if (hiddenField) {
-                if (this.checked) {
-                    hiddenField.disabled = true;
-                } else {
-                    hiddenField.disabled = false;
+    // Закрытие модального окна
+    if (span) {
+        span.onclick = function() {
+            modal.style.display = 'none';
+        }
+    }
+
+    if (modal) {
+        window.onclick = function(event) {
+            if (event.target == modal) {
+                modal.style.display = 'none';
+            }
+        }
+    }
+
+    // Исправление обработки чекбоксов
+    var bruteForceForm = document.querySelector('form input[name="submit_brute_force_protection"]');
+    if (bruteForceForm) {
+        var form = bruteForceForm.closest('form');
+        var checkboxes = form.querySelectorAll('input[type="checkbox"]');
+
+        checkboxes.forEach(function(checkbox) {
+            // Убираем скрытые поля при отправке если чекбокс отмечен
+            checkbox.addEventListener('change', function() {
+                var hiddenField = form.querySelector('input[type="hidden"][name="' + this.name + '"]');
+                if (hiddenField) {
+                    if (this.checked) {
+                        hiddenField.disabled = true;
+                    } else {
+                        hiddenField.disabled = false;
+                    }
                 }
+            });
+
+            // Инициализация при загрузке страницы
+            var hiddenField = form.querySelector('input[type="hidden"][name="' + checkbox.name + '"]');
+            if (hiddenField && checkbox.checked) {
+                hiddenField.disabled = true;
             }
         });
-
-        // Инициализация при загрузке страницы
-        var hiddenField = form.querySelector('input[type="hidden"][name="' + checkbox.name + '"]');
-        if (hiddenField && checkbox.checked) {
-            hiddenField.disabled = true;
-        }
-    });
-}
+    }
 });
+
+function addCurrentIP() {
+    var textarea = document.getElementById('login_whitelist_ips');
+    var currentIP = '<?php echo esc_js($current_user_ip); ?>';
+    if (textarea && textarea.value.indexOf(currentIP) === -1) {
+        textarea.value += (textarea.value ? '\n' : '') + currentIP;
+    }
+}
 </script>
 <?php
 }
