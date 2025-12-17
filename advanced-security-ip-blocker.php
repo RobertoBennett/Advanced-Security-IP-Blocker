@@ -1,14 +1,19 @@
 <?php
 /*
 Plugin Name: Advanced Security IP Blocker
-Description: Продвинутая система безопасности: блокировка IP, защита wp‑login.php и xmlrpc.php, блокировка опасных файлов и ботов с поддержкой ASN, гео‑блокировки, honeypot‑страниц, интеграция с внешними черными листами, Fail2Ban, Redis и WP‑CLI.
+Description: Продвинутая система безопасности: блокировка IP, защита wp‑login.php и xmlrpc.php, блокировка опасных файлов и ботов с поддержкой ASN, гео‑блокировки, honeypot‑страниц, интеграция с внешними черными листами, Fail2Ban, Redis, Cloudflare, Аналитикой и REST API.
 Plugin URI: https://github.com/RobertoBennett/IP-Blocker-Manager
-Version: 2.0.2
+Version: 2.1.0
 Author: Robert Bennett
 Text Domain: ip-blocker-manager
 */
 
 defined('ABSPATH') || exit;
+
+// Обновление версии плагина
+if (!defined('ASB_BLOCKER_VERSION')) {
+    define('ASB_BLOCKER_VERSION', '2.1.0');
+}
 
 /* ============================================================
    Основной класс плагина
@@ -27,10 +32,18 @@ class Advanced_Security_Blocker {
     private $marker_nginx   = '# NGINX_RULES_MARKER';
     private $backup_dir;
     private $cache_dir;
-    private $log = [];
+    public $log = []; // Сделано public для доступа из REST API
     private $cache_handler;
     private $geo_reader;
     private $redis;
+    
+    // Ключи настроек Cloudflare
+    private $cf_email_key   = 'asb_cloudflare_email';
+    private $cf_api_key     = 'asb_cloudflare_api_key';
+    private $cf_zone_id     = 'asb_cloudflare_zone_id';
+
+    // Ключ для журнала атак
+    const ASB_ATTACK_LOG_KEY = 'asb_attack_log';
 
     /* ----------------------------------------------------------
        Конструктор – регистрация хуков
@@ -82,6 +95,15 @@ class Advanced_Security_Blocker {
         // Инициализация вспомогательных компонентов (только чтение, скачивание - отдельно)
         $this->init_geo_reader_instance();
         $this->init_redis_client();
+
+        // REST API
+        add_action('rest_api_init', [$this, 'register_rest_routes']);
+
+        // Регистрация настроек Cloudflare
+        add_action('admin_init', [$this, 'asb_register_settings']);
+        
+        // Подключение скриптов для страницы аналитики
+        add_action('admin_enqueue_scripts', [$this, 'enqueue_analytics_scripts']);
     }
 
     /* ==========================================================
@@ -103,7 +125,10 @@ class Advanced_Security_Blocker {
             'asb_rate_limit_enabled'       => '0',
             'asb_geo_block_countries'      => '',
             'asb_telegram_token'           => '',
-            'asb_telegram_chat_id'         => ''
+            'asb_telegram_chat_id'         => '',
+            'asb_cloudflare_email'         => '',
+            'asb_cloudflare_api_key'       => '',
+            'asb_cloudflare_zone_id'       => ''
         ];
 
         foreach ($defaults as $key => $value) {
@@ -170,9 +195,9 @@ class Advanced_Security_Blocker {
         // Заглушка для init-хука, если нужна отдельная логика
     }
 
-    /* ==========================================================
-       1. UI и стили
-       ========================================================== */
+   /* ==========================================================
+   1. UI и стили
+   ========================================================== */
 
     public function admin_menu() {
         add_options_page(
@@ -181,6 +206,25 @@ class Advanced_Security_Blocker {
             'manage_options',
             'advanced-security-blocker',
             [$this, 'settings_page']
+        );
+        
+        // Добавляем подменю для аналитики и Cloudflare
+        add_submenu_page(
+            'options-general.php',
+            'Аналитика атак',
+            'Аналитика атак',
+            'manage_options',
+            'asb-analytics',
+            [$this, 'analytics_page']
+        );
+        
+        add_submenu_page(
+            'options-general.php',
+            'Cloudflare интеграция',
+            'Cloudflare',
+            'manage_options',
+            'asb-cloudflare',
+            [$this, 'cloudflare_settings_page']
         );
     }
 
@@ -237,13 +281,16 @@ class Advanced_Security_Blocker {
         .tablenav .pagination-links a{display:inline-block;padding:3px 5px;margin:0 2px;border:1px solid #ccc;background:#e5e5e5;text-decoration:none}
         .tablenav .pagination-links a:hover{background:#d5d5d5}
         .tablenav .paging-input{display:inline-block;margin:0 5px;line-height:30px}
+        /* Дополнительные стили для кнопок пагинации */
+        .tablenav .pagination-links .button{display:inline-block;padding:3px 5px;margin:0 2px;border:1px solid #ccc;background:#e5e5e5;text-decoration:none;cursor:pointer}
+        .tablenav .pagination-links .button:hover{background:#d5d5d5}
         </style>
         <?php
     }
 
-    /* ==========================================================
-       2. Создание каталогов и таблиц
-       ========================================================== */
+/* ==========================================================
+   2. Создание каталогов и таблиц
+   ========================================================== */
 
     public function create_backup_dir() {
         foreach ([$this->backup_dir, $this->cache_dir] as $dir) {
@@ -341,7 +388,9 @@ class Advanced_Security_Blocker {
             'asb_blocked_ips_list','asb_wp_blocked_ips','asb_whitelist_ips',
             'asb_clear_cache_enabled','asb_external_blacklist','asb_geo_block_countries',
             'asb_fail2ban_enabled','asb_redis_shared_blocklist','asb_telegram_token',
-            'asb_telegram_chat_id','asb_nginx_mode','asb_rate_limit_enabled'
+            'asb_telegram_chat_id','asb_nginx_mode','asb_rate_limit_enabled',
+            'asb_cloudflare_email','asb_cloudflare_api_key','asb_cloudflare_zone_id',
+            self::ASB_ATTACK_LOG_KEY
         ];
         foreach ($options as $opt) {
             delete_option($opt);
@@ -378,88 +427,97 @@ class Advanced_Security_Blocker {
        4. Работа с .htaccess
        ========================================================== */
 
-    /**
-     * Обновление правил IP (поддержка ASN, CIDR)
-     */
-    private function update_ip_rules($ips) {
-        $this->log = [];
-        try {
-            $this->create_backup();
-            $this->log[] = 'Создана резервная копия .htaccess';
+/**
+ * Обновление правил IP (поддержка ASN, CIDR)
+ */
+private function update_ip_rules($ips) {
+    $this->log = [];
+    try {
+        $this->create_backup();
+        $this->log[] = 'Создана резервная копия .htaccess';
 
-            $ip_list = array_filter(array_map('trim', explode("\n", $ips)));
-            $ip_list = array_unique($ip_list);
+        $ip_list = array_filter(array_map('trim', explode("\n", $ips)));
+        
+        // Удаление дублей с нормализацией
+        $unique_entries = [];
+        foreach ($ip_list as $entry) {
+            $normalized = $this->normalize_ip_entry($entry);
+            $unique_entries[$normalized] = $entry;
+        }
+        $ip_list = array_values($unique_entries);
+        
+        $valid = []; $invalid = []; $rules = []; $asn_ranges = [];
 
-            $valid = []; $invalid = []; $rules = []; $asn_ranges = [];
-
-            foreach ($ip_list as $entry) {
-                // ASN ?
-                if (preg_match('/^AS?(\d+)$/i', $entry, $m)) {
-                    $asn = $m[1];
-                    if (!$this->validate_asn($asn)) {
-                        $invalid[] = $entry;
-                        continue;
-                    }
-                    $this->log[] = "Обрабатываем ASN AS{$asn}";
-                    $ranges = $this->get_asn_ip_ranges($asn);
-                    if ($ranges) {
-                        foreach ($ranges as $r) {
-                            $rules[] = "deny from {$r}";
-                            $asn_ranges[] = $r;
-                        }
-                        $this->log[] = "ASN AS{$asn}: добавлено " . count($ranges) . " диапазонов";
-                    } else {
-                        $invalid[] = $entry;
-                    }
+        foreach ($ip_list as $entry) {
+            // ASN ?
+            if (preg_match('/^AS?(\d+)$/i', $entry, $m)) {
+                $asn = $m[1];
+                if (!$this->validate_asn($asn)) {
+                    $invalid[] = $entry;
+                    continue;
                 }
-                // CIDR ?
-                elseif (strpos($entry, '/') !== false) {
-                    list($ip, $mask) = explode('/', $entry, 2);
-                    if (filter_var($ip, FILTER_VALIDATE_IP) && is_numeric($mask) && $mask >= 0 && $mask <= 32) {
-                        $rules[] = "deny from {$entry}";
-                        $valid[] = $entry;
-                    } else {
-                        $invalid[] = $entry;
+                $this->log[] = "Обрабатываем ASN AS{$asn}";
+                $ranges = $this->get_asn_ip_ranges($asn);
+                if ($ranges) {
+                    foreach ($ranges as $r) {
+                        $rules[] = "deny from {$r}";
+                        $asn_ranges[] = $r;
                     }
+                    $this->log[] = "ASN AS{$asn}: добавлено " . count($ranges) . " диапазонов";
+                    $valid[] = $entry;
+                } else {
+                    $invalid[] = $entry;
                 }
-                // обычный IP
-                elseif (filter_var($entry, FILTER_VALIDATE_IP)) {
+            }
+            // CIDR ?
+            elseif (strpos($entry, '/') !== false) {
+                list($ip, $mask) = explode('/', $entry, 2);
+                if (filter_var($ip, FILTER_VALIDATE_IP) && is_numeric($mask) && $mask >= 0 && $mask <= 32) {
                     $rules[] = "deny from {$entry}";
                     $valid[] = $entry;
                 } else {
                     $invalid[] = $entry;
                 }
             }
-
-            if (!empty($invalid)) {
-                $this->log[] = "Некорректные записи: " . implode(', ', $invalid);
-            }
-
-            // Считываем текущий .htaccess и убираем старый блок
-            $htaccess = file_exists($this->htaccess_path) ? file_get_contents($this->htaccess_path) : '';
-            $htaccess = preg_replace('/\n?' . preg_quote($this->marker_ip, '/') . '.*?' . preg_quote($this->marker_ip, '/') . '/s', '', $htaccess);
-
-            if (!empty($rules)) {
-                $block = "\n{$this->marker_ip}\n" . implode("\n", $rules) . "\n{$this->marker_ip}\n";
-                $htaccess = $block . $htaccess;
-                $this->log[] = "Добавлено правил: " . count($rules) . " (IP:" . count($valid) . ", ASN:" . count(array_unique($asn_ranges)) . ")";
+            // обычный IP
+            elseif (filter_var($entry, FILTER_VALIDATE_IP)) {
+                $rules[] = "deny from {$entry}";
+                $valid[] = $entry;
             } else {
-                $this->log[] = "Все правила IP удалены";
+                $invalid[] = $entry;
             }
-
-            if (!file_put_contents($this->htaccess_path, $htaccess)) {
-                throw new Exception('Не удалось записать в .htaccess');
-            }
-
-            $this->log[] = 'Настройки IP успешно сохранены';
-            return true;
-
-        } catch (Exception $e) {
-            $this->restore_backup();
-            $this->log[] = 'Ошибка: ' . $e->getMessage() . ' – восстановлена резервная копия';
-            return $e->getMessage();
         }
+
+        if (!empty($invalid)) {
+            $this->log[] = "Некорректные записи: " . implode(', ', $invalid);
+        }
+
+        // Считываем текущий .htaccess и убираем старый блок
+        $htaccess = file_exists($this->htaccess_path) ? file_get_contents($this->htaccess_path) : '';
+        $htaccess = preg_replace('/\n?' . preg_quote($this->marker_ip, '/') . '.*?' . preg_quote($this->marker_ip, '/') . '/s', '', $htaccess);
+
+        if (!empty($rules)) {
+            $block = "\n{$this->marker_ip}\n" . implode("\n", $rules) . "\n{$this->marker_ip}\n";
+            $htaccess = $block . $htaccess;
+            $this->log[] = "Добавлено правил: " . count($rules) . " (IP:" . count($valid) . ", ASN:" . count(array_unique($asn_ranges)) . ")";
+            $this->log[] = "Удалено дублей: " . (count($ip_list) - count($unique_entries));
+        } else {
+            $this->log[] = "Все правила IP удалены";
+        }
+
+        if (!file_put_contents($this->htaccess_path, $htaccess)) {
+            throw new Exception('Не удалось записать в .htaccess');
+        }
+
+        $this->log[] = 'Настройки IP успешно сохранены';
+        return true;
+
+    } catch (Exception $e) {
+        $this->restore_backup();
+        $this->log[] = 'Ошибка: ' . $e->getMessage() . ' – восстановлена резервная копия';
+        return $e->getMessage();
     }
+}
 
     /**
      * Защита wp-login.php / xmlrpc.php
@@ -679,6 +737,8 @@ class Advanced_Security_Blocker {
         if (get_query_var('asb_honeypot')) {
             $ip = $this->get_user_ip();
             $this->block_ip_address($ip, 'honeypot', 'honeypot');
+            // Записываем атаку в журнал
+            $this->log_attack($ip, 'honeypot', $_SERVER['REQUEST_URI']);
             status_header(403);
             exit('Forbidden');
         }
@@ -760,7 +820,7 @@ class Advanced_Security_Blocker {
        5. Получение текущих правил
        ========================================================== */
 
-    // ИЗМЕНЕНО НА PUBLIC для доступа из WP-CLI
+    // ИЗМЕНЕНО НА PUBLIC для доступа из WP-CLI и REST API
     public function get_current_ips() {
         if (!file_exists($this->htaccess_path)) return '';
         $ht = file_get_contents($this->htaccess_path);
@@ -793,286 +853,770 @@ class Advanced_Security_Blocker {
         ];
     }
 
-    /* ==========================================================
-       6. Блокировка / разблокировка IP
-       ========================================================== */
+/* ==========================================================
+   6. Блокировка / разблокировка IP
+   ========================================================== */
 
-    /**
-     * Валидация IP/CIDR/ASN записи
-     */
-    private function validate_ip_entry($entry) {
-        // IP
-        if (filter_var($entry, FILTER_VALIDATE_IP)) return true;
-        // CIDR
-        if (strpos($entry, '/') !== false) {
-            list($ip, $mask) = explode('/', $entry, 2);
-            return filter_var($ip, FILTER_VALIDATE_IP) && is_numeric($mask) && $mask >= 0 && $mask <= 32;
+/**
+ * Валидация IP/CIDR/ASN записи
+ */
+private function validate_ip_entry($entry) {
+    $entry = trim($entry);
+    
+    // IP
+    if (filter_var($entry, FILTER_VALIDATE_IP)) return true;
+    // CIDR
+    if (strpos($entry, '/') !== false) {
+        list($ip, $mask) = explode('/', $entry, 2);
+        return filter_var($ip, FILTER_VALIDATE_IP) && is_numeric($mask) && $mask >= 0 && $mask <= 32;
+    }
+    // ASN
+    if (preg_match('/^AS?(\d+)$/i', $entry, $m)) {
+        return $this->validate_asn($m[1]);
+    }
+    return false;
+}
+
+/**
+ * Валидация ASN
+ */
+private function validate_asn($asn) {
+    $asn = str_replace(['AS', 'as'], '', $asn);
+    return is_numeric($asn) && $asn > 0 && $asn < 4294967296;
+}
+
+/**
+ * Нормализует IP запись для сравнения (удаляет дубли)
+ */
+private function normalize_ip_entry($entry) {
+    $entry = trim($entry);
+    
+    // ASN - приводим к единому формату
+    if (preg_match('/^AS?(\d+)$/i', $entry, $m)) {
+        return 'AS' . $m[1]; // Формат: AS1234
+    }
+    
+    // CIDR - нормализуем IP и маску
+    if (strpos($entry, '/') !== false) {
+        list($ip, $mask) = explode('/', $entry, 2);
+        $mask = intval($mask);
+        // Приводим IP к нормальной форме
+        $ip = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ? 
+              $ip : 
+              (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? $ip : '');
+        
+        if ($ip) {
+            // Для IPv4 CIDR нормализуем маску (0-32)
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                $mask = max(0, min(32, $mask));
+            }
+            return $ip . '/' . $mask;
         }
-        // ASN
-        if (preg_match('/^AS?(\d+)$/i', $entry, $m)) {
-            return $this->validate_asn($m[1]);
-        }
+    }
+    
+    // Обычный IP
+    if (filter_var($entry, FILTER_VALIDATE_IP)) {
+        return $entry;
+    }
+    
+    return $entry; // Возвращаем как есть, если не распознали
+}
+
+/**
+ * Получить тип записи (IP, CIDR, ASN)
+ */
+private function get_entry_type($entry) {
+    $entry = trim($entry);
+    
+    if (preg_match('/^AS?(\d+)$/i', $entry)) {
+        return 'ASN';
+    } elseif (strpos($entry, '/') !== false) {
+        return 'CIDR';
+    } elseif (filter_var($entry, FILTER_VALIDATE_IP)) {
+        return 'IP';
+    }
+    
+    return 'UNKNOWN';
+}
+
+/**
+ * Блокировка только на уровне WordPress (без .htaccess)
+ */
+private function block_ip_wordpress_only($ip_address, $username = '', $reason = '') {
+    global $wpdb;
+    
+    // Валидация IP/CIDR/ASN
+    if (!$this->validate_ip_entry($ip_address)) {
+        error_log("Security Blocker: Попытка заблокировать невалидную запись: {$ip_address}");
         return false;
     }
 
-    /**
-     * Валидация ASN
-     */
-    private function validate_asn($asn) {
-        $asn = str_replace(['AS', 'as'], '', $asn);
-        return is_numeric($asn) && $asn > 0 && $asn < 4294967296;
+    $entry_type = $this->get_entry_type($ip_address);
+    
+    // 1. Добавляем в постоянный список WordPress (для ВСЕХ типов - IP, CIDR, ASN)
+    $this->add_to_permanent_blocklist($ip_address);
+    
+    // 2. Для обычных IP также добавляем в файл блокировок
+    if ($entry_type === 'IP') {
+        $this->add_to_block_file($ip_address);
+        
+        // Помечаем в БД (только для IP)
+        $table = $wpdb->prefix . 'security_login_attempts';
+        $wpdb->update($table, ['blocked' => 1], ['ip_address' => $ip_address]);
+    }
+    
+    // 3. Redis‑шаред‑блоклист (только для IP)
+    if (get_option('asb_redis_shared_blocklist') && $this->redis && $entry_type === 'IP') {
+        try {
+            $ttl = 31536000; // 1 год для постоянных блокировок
+            $this->redis->set("asb:block:{$ip_address}", 1, $ttl);
+        } catch (Exception $e) {
+            error_log("ASB Redis error: " . $e->getMessage());
+        }
+    }
+    
+    // 4. Cloudflare блокировка (работает для всех типов)
+    $this->block_ip_cloudflare($ip_address, "Ручная блокировка WordPress: {$reason}");
+    
+    // 5. Уведомления
+    if (get_option('asb_email_notifications')) {
+        $this->send_block_notification($ip_address, $username, 0);
+    }
+    if (get_option('asb_telegram_token') && get_option('asb_telegram_chat_id')) {
+        $site_name = get_bloginfo('name');
+        $this->send_telegram_message("🔒 [{$site_name}] {$ip_address} заблокирован (ручная блокировка WordPress)");
+    }
+    
+    error_log("Security Blocker: {$ip_address} заблокирован на уровне WordPress (type={$entry_type}, reason: {$reason})");
+    return true;
+}
+
+// ИЗМЕНЕНО НА PUBLIC для доступа из WP-CLI и REST API
+public function block_ip_address($ip_address, $username = '', $attempts = 0) {
+    global $wpdb;
+    
+    // Валидация IP/CIDR/ASN
+    if (!$this->validate_ip_entry($ip_address)) {
+        error_log("Security Blocker: Попытка заблокировать невалидную запись: {$ip_address}");
+        return false;
     }
 
-    // ИЗМЕНЕНО НА PUBLIC для доступа из WP-CLI
-    public function block_ip_address($ip_address, $username = '', $attempts = 0) {
-        global $wpdb;
+    $table = $wpdb->prefix . 'security_login_attempts';
+    $entry_type = $this->get_entry_type($ip_address);
+
+    // 1. Помечаем в БД (только для IP)
+    if ($entry_type === 'IP') {
+        $wpdb->update($table, ['blocked' => 1], ['ip_address' => $ip_address]);
+    }
+
+    // 2. Добавляем в постоянный список WordPress (для ВСЕХ типов - IP, CIDR, ASN)
+    $block_duration = intval(get_option('asb_block_duration', 60));
+    if ($block_duration === 0) {
+        $this->add_to_permanent_blocklist($ip_address);
         
-        // Валидация IP
-        if (!filter_var($ip_address, FILTER_VALIDATE_IP)) {
-            error_log("Security Blocker: Попытка заблокировать невалидный IP: {$ip_address}");
+        // Для обычных IP также добавляем в файл блокировок
+        if ($entry_type === 'IP') {
+            $this->add_to_block_file($ip_address);
+        }
+    }
+
+    // 3. Добавляем в .htaccess (если включено) - работает для всех типов
+    if (get_option('asb_auto_add_to_htaccess')) {
+        $this->add_ip_to_htaccess($ip_address);
+    }
+
+    // 4. Fail2Ban – запись в syslog
+    if (get_option('asb_fail2ban_enabled')) {
+        $block_type = ($block_duration === 0) ? 'PERMANENT' : 'TEMPORARY';
+        error_log("asb: BLOCKED {$block_type} {$ip_address} ({$username})");
+    }
+
+    // 5. Redis‑шаред‑блоклист (только для IP)
+    if (get_option('asb_redis_shared_blocklist') && $this->redis && $entry_type === 'IP') {
+        try {
+            // Для постоянных блокировок ставим большее время
+            $ttl = ($block_duration === 0) ? 31536000 : 86400; // 1 год или 1 день
+            $this->redis->set("asb:block:{$ip_address}", 1, $ttl);
+        } catch (Exception $e) {
+            error_log("ASB Redis error: " . $e->getMessage());
+        }
+    }
+
+    // 6. Cloudflare блокировка (работает для всех типов)
+    $this->block_ip_cloudflare($ip_address, "Блокировка через плагин: {$username}");
+
+    // 7. Уведомления
+    if (get_option('asb_email_notifications')) {
+        $this->send_block_notification($ip_address, $username, $attempts);
+    }
+    if (get_option('asb_telegram_token') && get_option('asb_telegram_chat_id')) {
+        $site_name = get_bloginfo('name');
+        $block_type_text = ($block_duration === 0) ? 'постоянно' : 'временно';
+        $this->send_telegram_message("🔒 [{$site_name}] {$ip_address} заблокирован {$block_type_text} ({$username}) попыток: {$attempts}");
+    }
+
+    $block_type_log = ($block_duration === 0) ? 'постоянно' : 'временно';
+    error_log("Security Blocker: {$ip_address} заблокирован {$block_type_log} (type={$entry_type}, user={$username}, attempts={$attempts})");
+    return true;
+}
+
+// ИЗМЕНЕНО НА PUBLIC для доступа из WP-CLI и REST API
+public function unblock_ip_address($ip_address, $reason = '') {
+    global $wpdb;
+    $table = $wpdb->prefix . 'security_login_attempts';
+    $entry_type = $this->get_entry_type($ip_address);
+
+    // 1. Снимаем флаг blocked в БД (только для IP)
+    if ($entry_type === 'IP') {
+        $wpdb->update($table, ['blocked' => 0], ['ip_address' => $ip_address, 'blocked' => 1]);
+    }
+
+    // 2. Удаляем из списка WP (для всех типов записей)
+    $list = get_option('asb_wp_blocked_ips', '');
+    if ($list) {
+        $arr = array_filter(array_map('trim', explode("\n", $list)));
+        
+        // Удаляем с нормализацией для всех типов записей
+        $new_arr = [];
+        $normalized_target = $this->normalize_ip_entry($ip_address);
+        
+        foreach ($arr as $entry) {
+            if ($this->normalize_ip_entry($entry) !== $normalized_target) {
+                $new_arr[] = $entry;
+            }
+        }
+        
+        update_option('asb_wp_blocked_ips', implode("\n", $new_arr));
+    }
+
+    // 3. Удаляем из .htaccess (для всех типов)
+    $current = $this->get_current_ips();
+    if (!empty($current)) {
+        $arr = array_filter(array_map('trim', explode("\n", $current)));
+        
+        // Удаляем с нормализацией
+        $new_arr = [];
+        $normalized_target = $this->normalize_ip_entry($ip_address);
+        
+        foreach ($arr as $entry) {
+            if ($this->normalize_ip_entry($entry) !== $normalized_target) {
+                $new_arr[] = $entry;
+            }
+        }
+        
+        $this->update_ip_rules(implode("\n", $new_arr));
+    }
+
+    // 4. Записываем в историю разблокировок (для всех типов)
+    $unblock_tbl = $wpdb->prefix . 'security_unblock_history';
+    $user = wp_get_current_user();
+    $wpdb->insert($unblock_tbl, [
+        'ip_address'     => $ip_address,
+        'unblock_reason' => $reason,
+        'unblocked_by'   => $user->user_login
+    ]);
+
+    // 5. Redis‑очистка (только для IP)
+    if (get_option('asb_redis_shared_blocklist') && $this->redis && $entry_type === 'IP') {
+        try {
+            $this->redis->del("asb:block:{$ip_address}");
+        } catch (Exception $e) {
+            error_log("ASB Redis error: " . $e->getMessage());
+        }
+    }
+
+    // 6. Cloudflare разблокировка (для всех типов)
+    $this->unblock_ip_cloudflare($ip_address);
+
+    error_log("Security Blocker: {$ip_address} разблокирован (type={$entry_type}, reason: {$reason})");
+}
+
+private function add_ip_to_htaccess($ip_address) {
+    $current = $this->get_current_ips();
+    $list = array_filter(array_map('trim', explode("\n", $current)));
+    
+    // Проверяем на дублирование (нормализация для сравнения)
+    $normalized_list = [];
+    foreach ($list as $entry) {
+        $normalized_list[$this->normalize_ip_entry($entry)] = $entry;
+    }
+    
+    $normalized_ip = $this->normalize_ip_entry($ip_address);
+    if (!isset($normalized_list[$normalized_ip])) {
+        $list[] = $ip_address;
+        $this->update_ip_rules(implode("\n", $list));
+    }
+}
+
+private function add_to_permanent_blocklist($ip_address) {
+    $list = get_option('asb_wp_blocked_ips', '');
+    $arr = array_filter(array_map('trim', explode("\n", $list)));
+    
+    // Проверяем на дублирование с нормализацией
+    $normalized_new = $this->normalize_ip_entry($ip_address);
+    $is_duplicate = false;
+    
+    foreach ($arr as $existing) {
+        if ($this->normalize_ip_entry($existing) === $normalized_new) {
+            $is_duplicate = true;
+            break;
+        }
+    }
+    
+    if (!$is_duplicate) {
+        $arr[] = $ip_address;
+        update_option('asb_wp_blocked_ips', implode("\n", $arr));
+    }
+}
+
+/**
+ * Записать IP в файл блокировок (для wp-config.php проверки)
+ */
+private function add_to_block_file($ip_address) {
+    $file = ABSPATH . 'wp-content/blocked-ips.txt';
+    
+    // Создаем директорию если её нет
+    if (!is_dir(dirname($file))) {
+        wp_mkdir_p(dirname($file));
+    }
+    
+    $ips = [];
+    if (file_exists($file)) {
+        $ips = array_filter(array_map('trim', file($file)));
+    }
+    
+    if (!in_array($ip_address, $ips)) {
+        $ips[] = $ip_address;
+        $content = implode("\n", $ips);
+        
+        if (!file_put_contents($file, $content)) {
+            error_log("Security Blocker: Не удалось записать IP {$ip_address} в файл блокировок");
             return false;
         }
-
-        $table = $wpdb->prefix . 'security_login_attempts';
-
-        // 1. Помечаем в БД
-        $wpdb->update($table, ['blocked' => 1], ['ip_address' => $ip_address]);
-
-        // 2. Добавляем в .htaccess (если включено)
-        if (get_option('asb_auto_add_to_htaccess')) {
-            $this->add_ip_to_htaccess($ip_address);
+        
+        // Защищаем файл от прямого доступа
+        $htaccess = dirname($file) . '/.htaccess';
+        if (!file_exists($htaccess)) {
+            file_put_contents($htaccess, "Order deny,allow\nDeny from all\n");
         }
-
-        // 3. Добавляем в постоянный список WordPress (если длительность 0)
-        if (intval(get_option('asb_block_duration', 60)) === 0) {
-            $this->add_to_permanent_blocklist($ip_address);
-        }
-
-        // 4. Fail2Ban – запись в syslog
-        if (get_option('asb_fail2ban_enabled')) {
-            error_log("asb: BLOCKED {$ip_address} ({$username})");
-        }
-
-        // 5. Redis‑шаред‑блоклист
-        if (get_option('asb_redis_shared_blocklist') && $this->redis) {
-            try {
-                $this->redis->set("asb:block:{$ip_address}", 1, 86400);
-            } catch (Exception $e) {
-                error_log("ASB Redis error: " . $e->getMessage());
-            }
-        }
-
-        // 6. Уведомления
-        if (get_option('asb_email_notifications')) {
-            $this->send_block_notification($ip_address, $username, $attempts);
-        }
-        if (get_option('asb_telegram_token') && get_option('asb_telegram_chat_id')) {
-            $this->send_telegram_message("🔒 IP {$ip_address} заблокирован ({$username}) попыток: {$attempts}");
-        }
-
-        error_log("Security Blocker: IP {$ip_address} заблокирован (user={$username}, attempts={$attempts})");
+        
+        error_log("Security Blocker: IP {$ip_address} добавлен в файл блокировок");
         return true;
     }
+    
+    return false;
+}
 
-    // ИЗМЕНЕНО НА PUBLIC для доступа из WP-CLI
-    public function unblock_ip_address($ip_address, $reason = '') {
-        global $wpdb;
-        $table = $wpdb->prefix . 'security_login_attempts';
+/**
+ * Проверка IP на уровне WordPress (расширенная для CIDR и ASN)
+ */
+private function is_ip_blocked_at_wp_level($ip) {
+    $list = get_option('asb_wp_blocked_ips', '');
+    if (empty($list)) return false;
 
-        // 1. Снимаем флаг blocked в БД
-        $wpdb->update($table, ['blocked' => 0], ['ip_address' => $ip_address, 'blocked' => 1]);
+    $blocked_entries = array_filter(array_map('trim', explode("\n", $list)));
+    
+    // Сначала проверяем точное совпадение
+    if (in_array($ip, $blocked_entries)) {
+        return true;
+    }
+    
+    // Проверяем все записи
+    foreach ($blocked_entries as $entry) {
+        $entry_type = $this->get_entry_type($entry);
+        
+        switch ($entry_type) {
+            case 'IP':
+                if ($entry === $ip) return true;
+                break;
+                
+            case 'CIDR':
+                if (strpos($entry, '/') !== false && $this->ip_in_cidr($ip, $entry)) {
+                    return true;
+                }
+                break;
+                
+            case 'ASN':
+                // Для ASN получаем диапазоны и проверяем вхождение
+                $asn_ranges = $this->get_asn_ip_ranges($entry);
+                if ($asn_ranges) {
+                    foreach ($asn_ranges as $range) {
+                        if ($this->ip_in_cidr($ip, $range)) {
+                            return true;
+                        }
+                    }
+                }
+                break;
+        }
+    }
+    
+    return false;
+}
 
-        // 2. Удаляем из списка WP
-        $list = get_option('asb_wp_blocked_ips', '');
-        if ($list) {
-            $arr = array_filter(array_map('trim', explode("\n", $list)));
-            $new = array_diff($arr, [$ip_address]);
-            update_option('asb_wp_blocked_ips', implode("\n", $new));
+    /* ==========================================================
+       7. Обработка попыток входа (брутфорс) - ПОЛНОСТЬЮ ПЕРЕПИСАНО
+       ========================================================== */
+
+    /**
+     * Ранняя проверка доступа - САМЫЙ РАННИЙ ХУК
+     * Вызывается ДО загрузки темы и плагинов
+     */
+    public function check_ip_access() {
+        // Пропускаем cron и CLI
+        if (wp_doing_cron() || (defined('WP_CLI') && WP_CLI)) {
+            return;
         }
 
-        // 3. Удаляем из .htaccess
-        $current = $this->get_current_ips();
-        if (!empty($current)) {
-            $arr = array_filter(array_map('trim', explode("\n", $current)));
-            $new = array_diff($arr, [$ip_address]);
-            $this->update_ip_rules(implode("\n", $new));
+        if (!get_option('asb_brute_force_enabled')) {
+            return;
         }
 
-        // 4. Записываем в историю разблокировок
-        $unblock_tbl = $wpdb->prefix . 'security_unblock_history';
-        $user = wp_get_current_user();
-        $wpdb->insert($unblock_tbl, [
-            'ip_address'     => $ip_address,
-            'unblock_reason' => $reason,
-            'unblocked_by'   => $user->user_login
-        ]);
+        $ip = $this->get_user_ip();
+        
+        // Проверяем блокировку
+        $block_status = $this->get_ip_block_status($ip);
+        
+        if ($block_status) {
+            $this->block_access_and_die($ip, $block_status);
+        }
+        
+        // Geo-блокировка
+        $this->check_geo_blocking($ip);
+    }
 
-        // 5. Redis‑очистка
+    /**
+     * Получить статус блокировки IP (универсальный метод)
+     * Возвращает массив с информацией о блокировке или false
+     */
+    private function get_ip_block_status($ip) {
+        // 1. Проверка белого списка
+        if ($this->is_ip_whitelisted($ip)) {
+            return false;
+        }
+        
+        // 2. ПРИОРИТЕТ: Проверка постоянных блокировок в списке WP
+        if ($this->is_ip_blocked_at_wp_level($ip)) {
+            return [
+                'blocked' => true,
+                'type' => 'permanent',
+                'message' => 'Ваш IP заблокирован.'
+            ];
+        }
+        
+        // 3. Redis-быстрая проверка
         if (get_option('asb_redis_shared_blocklist') && $this->redis) {
             try {
-                $this->redis->del("asb:block:{$ip_address}");
+                $redis_data = $this->redis->get("asb:block:{$ip}");
+                if ($redis_data) {
+                    return [
+                        'blocked' => true,
+                        'type' => 'redis',
+                        'message' => 'Ваш IP временно заблокирован.',
+                        'data' => $redis_data
+                    ];
+                }
             } catch (Exception $e) {
                 error_log("ASB Redis error: " . $e->getMessage());
             }
         }
-
-        error_log("Security Blocker: IP {$ip_address} разблокирован (reason: {$reason})");
-    }
-
-    private function add_ip_to_htaccess($ip_address) {
-        $current = $this->get_current_ips();
-        $list = array_filter(array_map('trim', explode("\n", $current)));
-        if (!in_array($ip_address, $list)) {
-            $list[] = $ip_address;
-            $this->update_ip_rules(implode("\n", $list));
+        
+        // 4. Проверка временных блокировок в БД (ТОЛЬКО если duration > 0)
+        $duration = intval(get_option('asb_block_duration', 60));
+        
+        // ИСПРАВЛЕНИЕ: Пропускаем проверку БД если установлена постоянная блокировка
+        if ($duration > 0) {
+            global $wpdb;
+            $table = $wpdb->prefix . 'security_login_attempts';
+            
+            $blocked = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM $table
+                 WHERE ip_address = %s
+                   AND blocked = 1
+                   AND attempt_time > DATE_SUB(NOW(), INTERVAL %d MINUTE)
+                 ORDER BY attempt_time DESC
+                 LIMIT 1",
+                $ip, $duration
+            ));
+            
+            if ($blocked) {
+                $remaining = $duration - floor((time() - strtotime($blocked->attempt_time)) / 60);
+                return [
+                    'blocked' => true,
+                    'type' => 'temporary',
+                    'remaining' => max(1, $remaining),
+                    'message' => sprintf(
+                        'Ваш IP временно заблокирован. Попробуйте снова через %d мин.', 
+                        max(1, $remaining)
+                    )
+                ];
+            }
         }
+        
+        return false;
     }
 
-    private function add_to_permanent_blocklist($ip_address) {
-        $list = get_option('asb_wp_blocked_ips', '');
-        $arr = array_filter(array_map('trim', explode("\n", $list)));
-        if (!in_array($ip_address, $arr)) {
-            $arr[] = $ip_address;
-            update_option('asb_wp_blocked_ips', implode("\n", $arr));
+    /**
+     * Блокировка доступа с правильными заголовками
+     */
+    private function block_access_and_die($ip, $block_status) {
+        // Устанавливаем заголовки до любого вывода
+        if (!headers_sent()) {
+            status_header(403);
+            header('HTTP/1.1 403 Forbidden');
+            header('Content-Type: text/html; charset=utf-8');
+            header('X-Blocked-By: ASB-Security');
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+            header('Pragma: no-cache');
+            header('Expires: 0');
+            
+            // Retry-After для временных блокировок
+            if ($block_status['type'] === 'temporary' && isset($block_status['remaining'])) {
+                header('Retry-After: ' . ($block_status['remaining'] * 60));
+            }
+        }
+        
+        // Логирование
+        if (get_option('asb_fail2ban_enabled')) {
+            error_log("asb: BLOCKED {$ip} [{$block_status['type']}]");
+        }
+        
+        // Показываем страницу блокировки
+        $this->show_block_page($block_status);
+        
+        // Полностью останавливаем выполнение
+        exit;
+    }
+
+    /**
+     * Страница блокировки
+     */
+    private function show_block_page($block_status) {
+        $message = esc_html($block_status['message']);
+        
+        echo '<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>418 - Я чайник</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container { 
+            text-align: center; 
+            padding: 40px; 
+            max-width: 600px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.3);
+        }
+        .teapot-image {
+            max-width: 300px;
+            width: 100%;
+            height: auto;
+            margin: 0 auto 30px;
+            border-radius: 15px;
+            display: block;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+        }
+        h1 { 
+            font-size: 48px; 
+            margin-bottom: 15px; 
+            color: #ffcc00;
+            text-shadow: 0 2px 10px rgba(255, 204, 0, 0.3);
+        }
+        .status-code {
+            display: inline-block;
+            background: rgba(255, 204, 0, 0.15);
+            padding: 5px 15px;
+            border-radius: 30px;
+            margin-bottom: 20px;
+            font-weight: bold;
+            color: #ffcc00;
+        }
+        p { 
+            font-size: 18px; 
+            color: #a0a0a0; 
+            line-height: 1.6;
+            margin-bottom: 20px;
+        }
+        .message {
+            background: rgba(255, 204, 0, 0.1);
+            border: 1px solid rgba(255, 204, 0, 0.3);
+            border-radius: 12px;
+            padding: 25px;
+            margin-top: 25px;
+            font-style: italic;
+        }
+        .protocol-info {
+            margin-top: 25px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            font-size: 14px;
+            color: #888;
+        }
+        @media (max-width: 480px) {
+            .container { padding: 25px; }
+            h1 { font-size: 36px; }
+            .teapot-image { max-width: 250px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <img src="https://sexandrelationships.ru/wp-content/uploads/2025/12/69429e6948a7d-1765973609.webp" 
+             alt="Чайник" 
+             class="teapot-image"
+             onerror="this.style.display=\'none\';">
+        
+        <h1>418</h1>
+        <div class="status-code">I\'m a teapot</div>
+        <p>Извините, я всего лишь чайник и не могу выполнить ваш запрос.</p>
+        <div class="message">' . $message . '</div>
+        <div class="protocol-info">
+            RFC 2324: Hyper Text Coffee Pot Control Protocol (HTCPCP/1.0)
+        </div>
+    </div>
+</body>
+</html>';
+    }
+
+    /**
+     * Geo-блокировка
+     */
+    private function check_geo_blocking($ip) {
+        $blocked_countries = get_option('asb_geo_block_countries');
+        
+        if (!$blocked_countries) {
+            return;
+        }
+        
+        $countries = array_map('trim', explode(',', $blocked_countries));
+        $country = $this->get_ip_country($ip);
+        
+        if ($country && in_array($country, $countries, true)) {
+            $this->log_attack($ip, 'geo_block', $country);
+            
+            $this->block_access_and_die($ip, [
+                'blocked' => true,
+                'type' => 'geo',
+                'message' => 'Доступ из вашего региона ограничен.'
+            ]);
         }
     }
 
     /**
-     * Проверка IP на уровне WordPress
+     * Проверка при аутентификации
      */
-    private function is_ip_blocked_at_wp_level($ip) {
-        $list = get_option('asb_wp_blocked_ips', '');
-        if (empty($list)) return false;
-
-        $blocked = array_filter(array_map('trim', explode("\n", $list)));
-        foreach ($blocked as $entry) {
-            if ($entry === $ip) return true;
-            if (strpos($entry, '/') !== false && $this->ip_in_cidr($ip, $entry)) return true;
+    public function check_blocked_ip($user, $password) {
+        if (!get_option('asb_brute_force_enabled')) {
+            return $user;
         }
-        return false;
+        
+        // Если уже ошибка - пропускаем
+        if (is_wp_error($user)) {
+            return $user;
+        }
+        
+        $ip = $this->get_user_ip();
+        $block_status = $this->get_ip_block_status($ip);
+        
+        if ($block_status) {
+            return new WP_Error('ip_blocked', $block_status['message']);
+        }
+        
+        return $user;
     }
 
-    /* ==========================================================
-       7. Обработка попыток входа (брутфорс)
-       ========================================================== */
-
+    /**
+     * Обработка неудачных попыток входа
+     */
     public function handle_failed_login($username) {
-        if (!get_option('asb_brute_force_enabled')) return;
+        if (!get_option('asb_brute_force_enabled')) {
+            return;
+        }
+        
         $ip = $this->get_user_ip();
-
-        if ($this->is_ip_whitelisted($ip)) return;
-
+        
+        if ($this->is_ip_whitelisted($ip)) {
+            return;
+        }
+        
         global $wpdb;
         $table = $wpdb->prefix . 'security_login_attempts';
-        $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
-
+        $ua = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '';
+        
+        // Записываем попытку
         $wpdb->insert($table, [
-            'ip_address'  => $ip,
-            'username'    => sanitize_user($username),
-            'user_agent'  => sanitize_text_field($ua),
-            'attempt_time'=> current_time('mysql')
-        ]);
-
+            'ip_address'   => $ip,
+            'username'     => sanitize_user($username),
+            'user_agent'   => sanitize_text_field($ua),
+            'attempt_time' => current_time('mysql'),
+            'blocked'      => 0
+        ], ['%s', '%s', '%s', '%s', '%d']);
+        
         $max    = intval(get_option('asb_max_attempts', 5));
         $window = intval(get_option('asb_time_window', 15));
-
+        
+        // Считаем попытки за окно времени
         $cnt = $wpdb->get_var($wpdb->prepare(
             "SELECT COUNT(*) FROM $table
              WHERE ip_address = %s
                AND attempt_time > DATE_SUB(NOW(), INTERVAL %d MINUTE)",
             $ip, $window
         ));
-
-        if ($cnt >= $max) {
-            $this->block_ip_address($ip, $username, $cnt);
+        
+        // Fail2Ban логирование
+        if (get_option('asb_fail2ban_enabled')) {
+            error_log("asb: FAILED_LOGIN {$ip} user={$username} attempts={$cnt}/{$max}");
         }
-
-        if (get_option('asb_external_blacklist')) {
+        
+        // Блокируем если превышен лимит
+        if ($cnt >= $max) {
+            // Используем существующий метод block_ip_address
+            $this->block_ip_address($ip, $username, $cnt);
+            $this->log_attack($ip, 'brute_force', "User: {$username}, Attempts: {$cnt}");
+            
+            // Блокируем сразу после превышения
+            $block_status = $this->get_ip_block_status($ip);
+            if ($block_status) {
+                $this->block_access_and_die($ip, $block_status);
+            }
+        }
+        
+        // Проверка внешней репутации
+        if (get_option('asb_external_blacklist') && $cnt >= 2) {
             $reputation = $this->check_external_reputation($ip);
             if ($reputation && isset($reputation['score']) && $reputation['score'] < 30) {
-                $this->block_ip_address($ip, 'reputation', 0);
+                $this->block_ip_address($ip, 'bad_reputation', 0);
+                $this->log_attack($ip, 'bad_reputation', "Score: {$reputation['score']}");
             }
         }
     }
 
+    /**
+     * Проверка внешней репутации IP
+     */
     private function check_external_reputation($ip) {
-        $api_key = get_option('asb_external_api_key', '');
-        if (!$api_key) return false;
-        $url = "https://ipqualityscore.com/api/json/ip/{$api_key}/{$ip}";
-        $resp = wp_remote_get($url, ['timeout' => 10]);
-        if (is_wp_error($resp)) return false;
-        $data = json_decode(wp_remote_retrieve_body($resp), true);
-        return $data;
-    }
-
-    public function check_blocked_ip($user, $password) {
-        if (!get_option('asb_brute_force_enabled')) return $user;
-        $ip = $this->get_user_ip();
-        if ($this->is_ip_whitelisted($ip)) return $user;
-
-        // Redis‑быстрая проверка
-        if (get_option('asb_redis_shared_blocklist') && $this->redis) {
-            try {
-                if ($this->redis->exists("asb:block:{$ip}")) {
-                    return new WP_Error('ip_blocked_redis', 'Ваш IP временно заблокирован');
-                }
-            } catch (Exception $e) {
-                error_log("ASB Redis error: " . $e->getMessage());
-            }
+        // Используем IPQualityScore API (бесплатный план)
+        $url = "https://ipqualityscore.com/api/json/ip/reputation?ip={$ip}&strictness=1&allow_public_access=true";
+        $response = $this->fetch_url($url, 5);
+        
+        if ($response) {
+            $data = json_decode($response, true);
+            return $data;
         }
-
-        // Проверка в базе (временный бан)
-        global $wpdb;
-        $table = $wpdb->prefix . 'security_login_attempts';
-        $duration = intval(get_option('asb_block_duration', 60));
-
-        $blocked = $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM $table
-             WHERE ip_address = %s
-               AND blocked = 1
-               AND attempt_time > DATE_SUB(NOW(), INTERVAL %d MINUTE)",
-            $ip, $duration
-        ));
-
-        if ($blocked) {
-            $remaining = $duration - floor((time() - strtotime($blocked->attempt_time)) / 60);
-            return new WP_Error('ip_blocked_temporary',
-                sprintf('Ваш IP временно заблокирован. Попробуйте снова через %d минут.', max(1, $remaining)));
-        }
-
-        // Проверка постоянных блокировок
-        if ($this->is_ip_blocked_at_wp_level($ip)) {
-            return new WP_Error('ip_blocked_permanent', 'Ваш IP заблокирован.');
-        }
-
-        return $user;
-    }
-
-    public function check_ip_access() {
-        if (is_admin() || wp_doing_ajax() || wp_doing_cron()) return;
-        if (!get_option('asb_brute_force_enabled')) return;
-
-        $ip = $this->get_user_ip();
-        if ($this->is_ip_whitelisted($ip)) return;
-
-        // Fail2Ban‑лог
-        if (get_option('asb_fail2ban_enabled')) {
-            error_log("asb: ACCESS {$ip}");
-        }
-
-        // Geo‑блокировка
-        if (get_option('asb_geo_block_countries')) {
-            $blocked_countries = explode(',', get_option('asb_geo_block_countries'));
-            $country = $this->get_ip_country($ip);
-            if (in_array($country, $blocked_countries)) {
-                wp_die('Доступ запрещён (региональная блокировка).', '403', ['response' => 403]);
-            }
-        }
-
-        // Проверка уровня WP
-        if ($this->is_ip_blocked_at_wp_level($ip)) {
-            wp_die('Доступ запрещён (IP заблокирован).', '403', ['response' => 403]);
-        }
+        return false;
     }
 
     /* ==========================================================
@@ -1252,21 +1796,56 @@ class Advanced_Security_Blocker {
         return false;
     }
 
-    /* ==========================================================
-       11. IP‑в‑CIDR проверка
-       ========================================================== */
+ /* ==========================================================
+   11. IP‑в‑CIDR проверка
+   ========================================================== */
 
-    private function ip_in_cidr($ip, $cidr) {
-        if (!filter_var($ip, FILTER_VALIDATE_IP)) return false;
-        if (strpos($cidr, '/') === false) return $ip === $cidr;
+private function ip_in_cidr($ip, $cidr) {
+    if (!filter_var($ip, FILTER_VALIDATE_IP)) return false;
+    if (strpos($cidr, '/') === false) return $ip === $cidr;
 
-        list($subnet, $mask) = explode('/', $cidr);
-        if (!filter_var($subnet, FILTER_VALIDATE_IP) || !is_numeric($mask)) return false;
-        $ip_long     = ip2long($ip);
+    list($subnet, $mask) = explode('/', $cidr);
+    if (!filter_var($subnet, FILTER_VALIDATE_IP) || !is_numeric($mask)) return false;
+    
+    // Для IPv4
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && filter_var($subnet, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $ip_long = ip2long($ip);
         $subnet_long = ip2long($subnet);
-        $mask_long   = -1 << (32 - (int)$mask);
+        $mask_long = -1 << (32 - (int)$mask);
         return ($ip_long & $mask_long) === ($subnet_long & $mask_long);
     }
+    
+    // Для IPv6
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) && filter_var($subnet, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+        $ip_bin = inet_pton($ip);
+        $subnet_bin = inet_pton($subnet);
+        
+        if ($ip_bin === false || $subnet_bin === false) {
+            return false;
+        }
+        
+        // Сравниваем первые $mask бит
+        $mask_bytes = (int)$mask / 8;
+        $mask_remainder = (int)$mask % 8;
+        
+        // Сравниваем полные байты
+        if (strncmp($ip_bin, $subnet_bin, $mask_bytes) !== 0) {
+            return false;
+        }
+        
+        // Сравниваем остаточные биты
+        if ($mask_remainder > 0) {
+            $last_byte_ip = ord($ip_bin[$mask_bytes]);
+            $last_byte_subnet = ord($subnet_bin[$mask_bytes]);
+            $bitmask = 0xFF << (8 - $mask_remainder);
+            return ($last_byte_ip & $bitmask) === ($last_byte_subnet & $bitmask);
+        }
+        
+        return true;
+    }
+    
+    return false;
+}
 
     /* ==========================================================
        12. Уведомления
@@ -1276,6 +1855,7 @@ class Advanced_Security_Blocker {
         $admin = get_option('admin_email');
         $site  = get_bloginfo('name');
         $url   = get_site_url();
+        $time  = current_time('mysql');
 
         $subject = "[$site] IP $ip заблокирован";
         $msg = <<<EOT
@@ -1285,7 +1865,7 @@ IP: $ip
 Пользователь: $username
 Попыток: $attempts
 Метод: $method
-Время: " . current_time('mysql') . "
+Время: $time
 
 Ссылка в админ‑панели: {$url}/options-general.php?page=advanced-security-blocker
 EOT;
@@ -1442,29 +2022,24 @@ EOT;
                 <?php foreach ($data['blocks'] as $b): ?>
                     <tr>
                         <td><?php echo esc_html($b['ip']); ?></td>
-                        <td>
-                            <?php
+                        <td><?php
                             $labels = [
                                 'temporary' => '<span style="color:orange;">Временная</span>',
                                 'permanent'=> '<span style="color:red;">Постоянная</span>',
                                 'htaccess' => '<span style="color:purple;">.htaccess</span>'
                             ];
                             echo $labels[$b['type']] ?? $b['type'];
-                            ?>
-                        </td>
-                        <td>
-                            <?php
+                        ?></td>
+                        <td><?php
                             $type = 'IP';
                             if (strpos($b['ip'], 'AS') === 0) $type = 'ASN';
                             elseif (strpos($b['ip'], '/') !== false) $type = 'CIDR';
                             echo $type;
-                            ?>
-                        </td>
+                        ?></td>
                         <td><?php echo esc_html($b['last_attempt']); ?></td>
                         <td>
                             <a href="<?php echo wp_nonce_url(
-                                admin_url('options-general.php?page=advanced-security-blocker&unblock_ip=' . $b['ip'] . '&tab=manage-blocks&paged=' . $page . '&s=' . urlencode($search)),
-                                'unblock_ip'); ?>" class="button" onclick="return confirm('Разблокировать?');">Разблокировать</a>
+                                admin_url('options-general.php?page=advanced-security-blocker&unblock_ip=' . $b['ip'] . '&tab=manage-blocks&paged=' . $page . '&s=' . urlencode($search)), 'unblock_ip'); ?>" class="button" onclick="return confirm('Разблокировать?');">Разблокировать</a>
                             <button class="button view-history-btn" data-ip="<?php echo esc_attr($b['ip']); ?>">История</button>
                         </td>
                     </tr>
@@ -1512,23 +2087,35 @@ EOT;
         $tbl = $wpdb->prefix . 'security_login_attempts';
         $duration = intval(get_option('asb_block_duration', 60));
 
-        // Временные из БД
-        $temp = $wpdb->get_results($wpdb->prepare(
-            "SELECT DISTINCT ip_address, MAX(attempt_time) AS last_attempt
-             FROM $tbl
-             WHERE blocked=1 AND attempt_time > DATE_SUB(NOW(), INTERVAL %d MINUTE)
-             GROUP BY ip_address",
-            $duration
-        ));
-        foreach ($temp as $r) {
-            $result['temporary'][] = ['ip' => $r->ip_address, 'last_attempt' => $r->last_attempt, 'type' => 'temporary'];
+        // Временные из БД - только если длительность блокировки > 0
+        if ($duration > 0) {
+            $temp = $wpdb->get_results($wpdb->prepare(
+                "SELECT DISTINCT ip_address, MAX(attempt_time) AS last_attempt
+                 FROM $tbl
+                 WHERE blocked=1 AND attempt_time > DATE_SUB(NOW(), INTERVAL %d MINUTE)
+                 GROUP BY ip_address",
+                $duration
+            ));
+            foreach ($temp as $r) {
+                $result['temporary'][] = ['ip' => $r->ip_address, 'last_attempt' => $r->last_attempt, 'type' => 'temporary'];
+            }
         }
 
-        // Постоянные из опции
+        // Постоянные из опции (когда длительность = 0)
         $perm = get_option('asb_wp_blocked_ips', '');
         if ($perm) {
             foreach (array_filter(array_map('trim', explode("\n", $perm))) as $ip) {
-                $result['permanent'][] = ['ip' => $ip, 'last_attempt' => 'N/A', 'type' => 'permanent'];
+                // Проверяем, есть ли этот IP во временных блокировках
+                $is_temporary = false;
+                foreach ($result['temporary'] as $temp_ip) {
+                    if ($temp_ip['ip'] === $ip) {
+                        $is_temporary = true;
+                        break;
+                    }
+                }
+                if (!$is_temporary) {
+                    $result['permanent'][] = ['ip' => $ip, 'last_attempt' => 'N/A', 'type' => 'permanent'];
+                }
             }
         }
 
@@ -1536,9 +2123,16 @@ EOT;
         $ht = $this->get_current_ips();
         if ($ht) {
             foreach (array_filter(explode("\n", $ht)) as $ip) {
+                // Проверяем, есть ли этот IP уже в постоянных или временных
                 $exists = false;
                 foreach ($result['permanent'] as $p) {
                     if ($p['ip'] === $ip) {
+                        $exists = true;
+                        break;
+                    }
+                }
+                foreach ($result['temporary'] as $t) {
+                    if ($t['ip'] === $ip) {
                         $exists = true;
                         break;
                     }
@@ -1569,130 +2163,142 @@ EOT;
     }
 
     /* ==========================================================
-       14. Обработчики форм и запросов
-       ========================================================== */
+   14. Обработчики форм и запросов
+   ========================================================== */
 
-    /**
-     * Обработчик разблокировки IP
-     */
-    public function handle_unblock_request() {
-        if (!isset($_GET['page']) || $_GET['page'] !== 'advanced-security-blocker') return;
-        if (!isset($_GET['unblock_ip'])) return;
-        if (!current_user_can('manage_options')) return;
+/**
+ * Обработчик разблокировки IP
+ */
+public function handle_unblock_request() {
+    if (!isset($_GET['page']) || $_GET['page'] !== 'advanced-security-blocker') return;
+    if (!isset($_GET['unblock_ip'])) return;
+    if (!current_user_can('manage_options')) return;
 
-        check_admin_referer('unblock_ip');
+    check_admin_referer('unblock_ip');
 
-        $ip = sanitize_text_field($_GET['unblock_ip']);
-        $reason = 'Разблокировано администратором';
+    $ip = sanitize_text_field($_GET['unblock_ip']);
+    $reason = 'Разблокировано администратором';
 
-        $this->unblock_ip_address($ip, $reason);
+    $this->unblock_ip_address($ip, $reason);
 
-        $redirect = admin_url('options-general.php?page=advanced-security-blocker&tab=manage-blocks&unblocked=1');
-        if (isset($_GET['paged'])) $redirect .= '&paged=' . intval($_GET['paged']);
-        if (isset($_GET['s'])) $redirect .= '&s=' . urlencode($_GET['s']);
+    $redirect = admin_url('options-general.php?page=advanced-security-blocker&tab=manage-blocks&unblocked=1');
+    if (isset($_GET['paged'])) $redirect .= '&paged=' . intval($_GET['paged']);
+    if (isset($_GET['s'])) $redirect .= '&s=' . urlencode($_GET['s']);
 
-        wp_redirect($redirect);
+    wp_redirect($redirect);
+    exit;
+}
+
+/**
+ * Обработчик ручной блокировки IP
+ */
+public function handle_manual_block_request() {
+    if (!isset($_POST['submit_manual_block'])) return;
+    if (!current_user_can('manage_options')) return;
+
+    check_admin_referer('security_blocker_update');
+
+    $ip = sanitize_text_field($_POST['manual_block_ip'] ?? '');
+    $reason = sanitize_text_field($_POST['block_reason'] ?? '');
+
+    if (empty($ip)) {
+        wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&error=invalid_ip'));
         exit;
     }
 
-    /**
-     * Обработчик ручной блокировки IP
-     */
-    public function handle_manual_block_request() {
-        if (!isset($_POST['submit_manual_block'])) return;
-        if (!current_user_can('manage_options')) return;
+    if (!$this->validate_ip_entry($ip)) {
+        wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&error=invalid_ip'));
+        exit;
+    }
 
+    // Используем метод блокировки только на уровне WordPress
+    $this->block_ip_wordpress_only($ip, 'manual', $reason);
+
+    $entry_type = $this->get_entry_type($ip);
+    $type_label = ($entry_type === 'ASN') ? 'ASN' : (($entry_type === 'CIDR') ? 'диапазон' : 'IP');
+    
+    wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&tab=manage-blocks&manual_block=1&message=' . urlencode("{$type_label} добавлен в чёрный список (WordPress)")));
+    exit;
+}
+
+/**
+ * Обработчик белого списка
+ */
+public function handle_whitelist_request() {
+    if (!isset($_GET['page']) || $_GET['page'] !== 'advanced-security-blocker') return;
+
+    // Добавление в whitelist
+    if (isset($_POST['submit_whitelist'])) {
+        if (!current_user_can('manage_options')) return;
         check_admin_referer('security_blocker_update');
 
-        $ip = sanitize_text_field($_POST['manual_block_ip'] ?? '');
-        $reason = sanitize_text_field($_POST['block_reason'] ?? '');
+        $ip = sanitize_text_field($_POST['whitelist_ip'] ?? '');
+        $reason = sanitize_text_field($_POST['whitelist_reason'] ?? '');
 
-        if (empty($ip)) {
-            wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&error=invalid_ip'));
+        if (!empty($ip) && $this->validate_ip_entry($ip)) {
+            $this->add_to_whitelist($ip, $reason);
+            wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&tab=whitelist&whitelist_added=1'));
             exit;
         }
+    }
 
-        if (!$this->validate_ip_entry($ip)) {
-            wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&error=invalid_ip'));
-            exit;
-        }
+    // Удаление из whitelist
+    if (isset($_GET['remove_whitelist'])) {
+        if (!current_user_can('manage_options')) return;
+        check_admin_referer('remove_whitelist');
 
-        $this->block_ip_address($ip, 'manual', 0);
+        $ip = sanitize_text_field($_GET['remove_whitelist']);
+        $this->remove_from_whitelist($ip);
 
-        wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&tab=manage-blocks&manual_block=1'));
+        wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&tab=whitelist&whitelist_removed=1'));
         exit;
     }
+}
 
-    /**
-     * Обработчик белого списка
-     */
-    public function handle_whitelist_request() {
-        if (!isset($_GET['page']) || $_GET['page'] !== 'advanced-security-blocker') return;
-
-        // Добавление в whitelist
-        if (isset($_POST['submit_whitelist'])) {
-            if (!current_user_can('manage_options')) return;
-            check_admin_referer('security_blocker_update');
-
-            $ip = sanitize_text_field($_POST['whitelist_ip'] ?? '');
-            $reason = sanitize_text_field($_POST['whitelist_reason'] ?? '');
-
-            if (!empty($ip) && $this->validate_ip_entry($ip)) {
-                $this->add_to_whitelist($ip, $reason);
-                wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&tab=whitelist&whitelist_added=1'));
-                exit;
-            }
-        }
-
-        // Удаление из whitelist
-        if (isset($_GET['remove_whitelist'])) {
-            if (!current_user_can('manage_options')) return;
-            check_admin_referer('remove_whitelist');
-
-            $ip = sanitize_text_field($_GET['remove_whitelist']);
-            $this->remove_from_whitelist($ip);
-
-            wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&tab=whitelist&whitelist_removed=1'));
+public function handle_backup_request() {
+    if (isset($_GET['page']) && $_GET['page'] === 'advanced-security-blocker' && isset($_GET['backup'])) {
+        if (current_user_can('manage_options')) {
+            $this->create_backup();
+            wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&backup_created=1'));
             exit;
         }
     }
+}
 
-    public function handle_backup_request() {
-        if (isset($_GET['page']) && $_GET['page'] === 'advanced-security-blocker' && isset($_GET['backup'])) {
-            if (current_user_can('manage_options')) {
-                $this->create_backup();
-                wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&backup_created=1'));
-                exit;
-            }
+public function handle_cache_clear() {
+    if (isset($_GET['page']) && $_GET['page'] === 'advanced-security-blocker' && isset($_GET['clear_cache'])) {
+        if (current_user_can('manage_options')) {
+            $this->clear_asn_cache();
+            $this->cache_handler->clear_all_caches();
+            wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&cache_cleared=1'));
+            exit;
         }
     }
+}
 
-    public function handle_cache_clear() {
-        if (isset($_GET['page']) && $_GET['page'] === 'advanced-security-blocker' && isset($_GET['clear_cache'])) {
-            if (current_user_can('manage_options')) {
-                $this->clear_asn_cache();
-                $this->cache_handler->clear_all_caches();
-                wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&cache_cleared=1'));
-                exit;
-            }
+public function generate_nginx_fragment() {
+    if (isset($_GET['page']) && $_GET['page'] === 'advanced-security-blocker' && isset($_GET['generate_nginx'])) {
+        if (current_user_can('manage_options')) {
+            $this->write_nginx_rules_file();
+            wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&nginx_generated=1'));
+            exit;
         }
     }
-
-    public function generate_nginx_fragment() {
-        if (isset($_GET['page']) && $_GET['page'] === 'advanced-security-blocker' && isset($_GET['generate_nginx'])) {
-            if (current_user_can('manage_options')) {
-                $this->write_nginx_rules_file();
-                wp_redirect(admin_url('options-general.php?page=advanced-security-blocker&nginx_generated=1'));
-                exit;
-            }
-        }
-    }
+}
 
     /* ==========================================================
        15. Вспомогательные методы
        ========================================================== */
 
     private function get_user_ip() {
+        // Проверка заголовка Cloudflare в первую очередь
+        if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+            $ip = $_SERVER['HTTP_CF_CONNECTING_IP'];
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                return $ip;
+            }
+        }
+
         $keys = ['HTTP_X_FORWARDED_FOR', 'HTTP_CLIENT_IP', 'REMOTE_ADDR'];
         foreach ($keys as $k) {
             if (!empty($_SERVER[$k])) {
@@ -1728,30 +2334,337 @@ EOT;
     }
 
     /* ==========================================================
-       16. Страница настроек (основная UI)
+       16. REST API
+       ========================================================== */
+
+    /**
+     * Регистрирует маршруты REST API для управления блокировками.
+     */
+    public function register_rest_routes() {
+        register_rest_route('asb/v1', '/block', [
+            'methods'  => 'POST',
+            'callback' => [$this, 'rest_block_ip'],
+            'permission_callback' => function () {
+                return current_user_can('manage_options');
+            },
+            'args' => [
+                'target' => [
+                    'required' => true,
+                    'validate_callback' => function($param) { return is_string($param) && !empty($param); }
+                ],
+                'reason' => [
+                    'required' => false,
+                    'default'  => 'REST API',
+                    'sanitize_callback' => 'sanitize_text_field'
+                ]
+            ]
+        ]);
+        
+        register_rest_route('asb/v1', '/unblock', [
+            'methods'  => 'POST',
+            'callback' => [$this, 'rest_unblock_ip'],
+            'permission_callback' => function () {
+                return current_user_can('manage_options');
+            },
+            'args' => [
+                'target' => [
+                    'required' => true,
+                    'validate_callback' => function($param) { return is_string($param) && !empty($param); }
+                ]
+            ]
+        ]);
+
+        register_rest_route('asb/v1', '/list', [
+            'methods'  => 'GET',
+            'callback' => [$this, 'rest_list_ips'],
+            'permission_callback' => function () {
+                return current_user_can('manage_options');
+            }
+        ]);
+    }
+
+    /**
+     * REST API Callback: Блокировка IP.
+     */
+    public function rest_block_ip(WP_REST_Request $request) {
+        $target = $request->get_param('target');
+        $reason = $request->get_param('reason');
+        
+        $this->block_ip_address($target, 'REST API', $reason);
+        
+        return new WP_REST_Response([
+            'success' => true,
+            'message' => sprintf('IP/ASN %s заблокирован. Проверьте лог для Cloudflare.', $target),
+            'log'     => $this->log,
+        ], 200);
+    }
+
+    /**
+     * REST API Callback: Разблокировка IP.
+     */
+    public function rest_unblock_ip(WP_REST_Request $request) {
+        $target = $request->get_param('target');
+        
+        $this->unblock_ip_address($target, 'REST API');
+        
+        return new WP_REST_Response([
+            'success' => true,
+            'message' => sprintf('IP %s разблокирован. Проверьте лог для Cloudflare.', $target),
+            'log'     => $this->log,
+        ], 200);
+    }
+
+    /**
+     * REST API Callback: Список заблокированных IP.
+     */
+    public function rest_list_ips(WP_REST_Request $request) {
+        $list_raw = $this->get_current_ips();
+        $list = array_filter(array_map('trim', explode("\n", $list_raw)));
+        
+        return new WP_REST_Response([
+            'success' => true,
+            'blocked_ips' => $list,
+            'count'   => count($list),
+        ], 200);
+    }
+
+    /* ==========================================================
+       17. Cloudflare интеграция
+       ========================================================== */
+
+    /**
+     * Проверяет, настроена ли интеграция с Cloudflare.
+     */
+    private function is_cloudflare_configured() {
+        return (
+            get_option($this->cf_email_key) &&
+            get_option($this->cf_api_key) &&
+            get_option($this->cf_zone_id)
+        );
+    }
+
+    /**
+     * Возвращает заголовки для Cloudflare API.
+     */
+    private function get_cf_headers() {
+        return [
+            'X-Auth-Email' => get_option($this->cf_email_key),
+            'X-Auth-Key'   => get_option($this->cf_api_key),
+            'Content-Type' => 'application/json',
+        ];
+    }
+
+    /**
+     * Блокирует IP/ASN в Cloudflare через Firewall Rules API.
+     */
+    private function block_ip_cloudflare($target, $reason) {
+        if (!$this->is_cloudflare_configured()) return false;
+
+        $zone_id = get_option($this->cf_zone_id);
+        $is_asn = strpos($target, 'AS') === 0;
+        $target_type = $is_asn ? 'asn' : 'ip';
+
+        $url = "https://api.cloudflare.com/client/v4/zones/{$zone_id}/firewall/access_rules/rules";
+
+        $body = [
+            'mode' => 'block',
+            'configuration' => [
+                'target' => $target_type,
+                'value'  => $target,
+            ],
+            'notes' => "ASB: {$reason} - {$target}",
+        ];
+
+        $response = wp_remote_post($url, [
+            'headers' => $this->get_cf_headers(),
+            'body'    => json_encode($body),
+            'data_format' => 'body',
+            'timeout' => 30,
+        ]);
+
+        if (is_wp_error($response)) {
+            $this->log[] = "Cloudflare Block Error: " . $response->get_error_message();
+            return false;
+        }
+
+        $response_code = wp_remote_retrieve_response_code($response);
+        $response_body = json_decode(wp_remote_retrieve_body($response), true);
+
+        if ($response_code !== 200 || ($response_body['success'] ?? false) !== true) {
+            $error_msg = isset($response_body['errors'][0]['message']) ? $response_body['errors'][0]['message'] : 'Неизвестная ошибка Cloudflare API.';
+            $this->log[] = "Cloudflare Block Failed (Code {$response_code}): {$error_msg}";
+            return false;
+        }
+
+        $this->log[] = "Cloudflare Block Success for {$target}. Rule ID: " . ($response_body['result']['id'] ?? 'N/A');
+        return true;
+    }
+
+    /**
+     * Разблокирует IP/ASN в Cloudflare (путем поиска и удаления правила).
+     */
+    private function unblock_ip_cloudflare($target) {
+        if (!$this->is_cloudflare_configured()) return false;
+
+        $zone_id = get_option($this->cf_zone_id);
+        $is_asn = strpos($target, 'AS') === 0;
+        $target_type = $is_asn ? 'asn' : 'ip';
+
+        // 1. Найти Rule ID
+        $search_url = "https://api.cloudflare.com/client/v4/zones/{$zone_id}/firewall/access_rules/rules?mode=block&configuration.target={$target_type}&configuration.value={$target}&per_page=1";
+        $response_search = wp_remote_get($search_url, [
+            'headers' => $this->get_cf_headers(),
+            'timeout' => 30,
+        ]);
+
+        if (is_wp_error($response_search) || wp_remote_retrieve_response_code($response_search) !== 200) {
+            $this->log[] = "Cloudflare Unblock Error (Search): " . (is_wp_error($response_search) ? $response_search->get_error_message() : 'Ошибка поиска правила.');
+            return false;
+        }
+
+        $search_body = json_decode(wp_remote_retrieve_body($response_search), true);
+        $rule = $search_body['result'][0] ?? null;
+
+        if (!$rule) {
+            $this->log[] = "Cloudflare Unblock Warning: Правило не найдено для {$target}.";
+            return true;
+        }
+
+        $rule_id = $rule['id'];
+
+        // 2. Удалить правило
+        $delete_url = "https://api.cloudflare.com/client/v4/zones/{$zone_id}/firewall/access_rules/rules/{$rule_id}";
+        $response_delete = wp_remote_request($delete_url, [
+            'method'  => 'DELETE',
+            'headers' => $this->get_cf_headers(),
+            'timeout' => 30,
+        ]);
+
+        if (is_wp_error($response_delete) || wp_remote_retrieve_response_code($response_delete) !== 200) {
+            $this->log[] = "Cloudflare Unblock Failed (Delete): " . (is_wp_error($response_delete) ? $response_delete->get_error_message() : 'Неизвестная ошибка Cloudflare API при удалении.');
+            return false;
+        }
+
+        $this->log[] = "Cloudflare Unblock Success for {$target} (Rule ID: {$rule_id}).";
+        return true;
+    }
+
+    /* ==========================================================
+       18. Журнал и Аналитика Атак
+       ========================================================== */
+
+    /**
+     * Записывает попытку атаки в журнал.
+     *
+     * @param string $ip IP-адрес атакующего.
+     * @param string $type Тип атаки.
+     * @param string $target Цель (файл, имя пользователя).
+     */
+    public function log_attack($ip, $type, $target = '') {
+        $log_entry = [
+            'time'   => time(),
+            'ip'     => $ip,
+            'type'   => sanitize_text_field($type), // e.g., 'login_fail', '404_access', 'honeypot'
+            'target' => sanitize_text_field($target), // e.g., requested file, username
+        ];
+
+        $log = get_option(self::ASB_ATTACK_LOG_KEY, []);
+
+        // Ограничение размера журнала (например, 5000 записей)
+        if (count($log) > 5000) {
+            // Удаляем 100 старых записей
+            $log = array_slice($log, 100);
+        }
+
+        $log[] = $log_entry;
+        update_option(self::ASB_ATTACK_LOG_KEY, $log, 'no');
+    }
+
+    /**
+     * Получает агрегированные данные для аналитики
+     */
+    private function get_analytics_data() {
+        $log = get_option(self::ASB_ATTACK_LOG_KEY, []);
+        
+        if (!is_array($log)) {
+            $log = [];
+        }
+
+        $data = [
+            'total_attacks' => count($log),
+            'attacks_by_type' => [],
+            'attacks_by_day' => [],
+            'blocked_ips_count' => count(array_filter(explode("\n", $this->get_current_ips()))),
+            'unique_attackers' => [],
+            'unique_attackers_count' => 0
+        ];
+
+        // Инициализируем массивы для последних 30 дней
+        $last_30_days = [];
+        $today = strtotime('today');
+        for ($i = 29; $i >= 0; $i--) {
+            $date = date('Y-m-d', strtotime("-$i days", $today));
+            $last_30_days[$date] = 0;
+        }
+
+        // Обрабатываем каждую запись в логе
+        foreach ($log as $entry) {
+            if (!is_array($entry) || !isset($entry['time'], $entry['type'], $entry['ip'])) {
+                continue;
+            }
+
+            $type = sanitize_text_field($entry['type']);
+            $time = intval($entry['time']);
+            $ip = sanitize_text_field($entry['ip']);
+            $day = gmdate('Y-m-d', $time);
+
+            // По типу атаки
+            if (!isset($data['attacks_by_type'][$type])) {
+                $data['attacks_by_type'][$type] = 0;
+            }
+            $data['attacks_by_type'][$type]++;
+
+            // По дням (только последние 30 дней)
+            if (isset($last_30_days[$day])) {
+                $last_30_days[$day]++;
+            }
+
+            // Уникальные IP
+            $data['unique_attackers'][$ip] = true;
+        }
+
+        // Форматируем данные для графиков
+        $data['attacks_by_day'] = $last_30_days;
+        $data['unique_attackers_count'] = count($data['unique_attackers']);
+
+        return $data;
+    }
+
+    /* ==========================================================
+       19. Страница настроек (основная UI)
        ========================================================== */
 
     public function settings_page() {
-        if (!current_user_can('manage_options')) return;
+    if (!current_user_can('manage_options')) return;
 
-        // Обработка сообщений
-        $error = $success = '';
-        if (isset($_GET['backup_created']))    $success = 'Резервная копия создана';
-        if (isset($_GET['cache_cleared']))     $success = 'Кеш очищен';
-        if (isset($_GET['unblocked']))         $success = 'IP разблокирован';
-        if (isset($_GET['manual_block']))      $success = 'IP добавлен в чёрный список';
-        if (isset($_GET['whitelist_added']))   $success = 'IP добавлен в белый список';
-        if (isset($_GET['whitelist_removed'])) $success = 'IP удалён из белого списка';
-        if (isset($_GET['error']) && $_GET['error'] === 'invalid_ip') $error = 'Неверный формат IP/ASN';
+    // Обработка сообщений
+    $error = $success = '';
+    if (isset($_GET['backup_created']))    $success = 'Резервная копия создана';
+    if (isset($_GET['cache_cleared']))     $success = 'Кеш очищен';
+    if (isset($_GET['unblocked']))         $success = 'IP разблокирован';
+    if (isset($_GET['manual_block']))      $success = isset($_GET['message']) ? urldecode($_GET['message']) : 'IP добавлен в чёрный список';
+    if (isset($_GET['whitelist_added']))   $success = 'IP добавлен в белый список';
+    if (isset($_GET['whitelist_removed'])) $success = 'IP удалён из белого списка';
+    if (isset($_GET['error']) && $_GET['error'] === 'invalid_ip') $error = 'Неверный формат IP/ASN/CIDR';
 
-        // Обновление IP‑блоков
-        if (isset($_POST['submit_ip_blocker'])) {
-            check_admin_referer('security_blocker_update');
-            $ips = sanitize_textarea_field($_POST['ip_addresses'] ?? '');
-            $res = $this->update_ip_rules($ips);
-            if ($res === true) $success = 'IP‑правила обновлены';
-            else $error = 'Ошибка IP‑правил: ' . $res;
-        }
+    // Обновление IP‑блоков
+    if (isset($_POST['submit_ip_blocker'])) {
+        check_admin_referer('security_blocker_update');
+        $ips = sanitize_textarea_field($_POST['ip_addresses'] ?? '');
+        $res = $this->update_ip_rules($ips);
+        if ($res === true) $success = 'IP‑правила обновлены (дубли удалены)';
+        else $error = 'Ошибка IP‑правил: ' . $res;
+    }
 
         // Защита wp‑login / xmlrpc
         if (isset($_POST['submit_login_protection'])) {
@@ -1846,7 +2759,7 @@ EOT;
         global $wpdb;
         ?>
         <div class="wrap">
-            <h1>Продвинутая система безопасности</h1>
+            <h1>Продвинутая система безопасности v<?php echo ASB_BLOCKER_VERSION; ?></h1>
             <?php if ($error): ?>
                 <div class="notice notice-error"><p><?php echo esc_html($error); ?></p></div>
             <?php endif; ?>
@@ -2096,6 +3009,7 @@ EOT;
                                     <th><label for="ip-search">IP:</label></th>
                                     <td>
                                         <input type="text" id="ip-search" name="s" value="<?php echo esc_attr($search_q); ?>" placeholder="Введите IP">
+										<input type="hidden" name="paged" value="<?php echo esc_attr($cur_page); ?>">
                                         <button type="submit" class="button">Поиск</button>
                                         <?php if (!empty($search_q)): ?>
                                             <a href="<?php echo admin_url('options-general.php?page=advanced-security-blocker&tab=manage-blocks'); ?>" class="button">Сбросить</a>
@@ -2132,7 +3046,7 @@ EOT;
                                 </div>
 
                                 <table class="attempts-table">
-                                    <thead><tr><th>IP / ASN</th><th>Тип</th><th>Запись</th><th>Последняя попытка</th><th>Действия</th></tr></thead>
+                                    <thead><tr><th>IP / ASN</th><th>Тип блокировки</th><th>Запись</th><th>Последняя попытка</th><th>Действия</th></tr></thead>
                                     <tbody>
                                         <?php foreach ($blocks_to_show as $b): ?>
                                             <tr>
@@ -2154,13 +3068,12 @@ EOT;
                                                 <td><?php echo esc_html($b['last_attempt']); ?></td>
                                                 <td>
                                                     <a href="<?php echo wp_nonce_url(
-                                                        admin_url('options-general.php?page=advanced-security-blocker&unblock_ip=' . $b['ip'] . '&tab=manage-blocks&paged=' . $cur_page . '&s=' . urlencode($search_q)),
-                                                        'unblock_ip'); ?>" class="button" onclick="return confirm('Разблокировать?');">Разблокировать</a>
+                                                        admin_url('options-general.php?page=advanced-security-blocker&unblock_ip=' . $b['ip'] . '&tab=manage-blocks&paged=' . $cur_page . '&s=' . urlencode($search_q)), 'unblock_ip'); ?>" class="button" onclick="return confirm('Разблокировать?');">Разблокировать</a>
                                                     <button class="button view-history-btn" data-ip="<?php echo esc_attr($b['ip']); ?>">История</button>
                                                 </td>
                                             </tr>
                                         <?php endforeach; ?>
-                                    </tbody>
+                                        </tbody>
                                 </table>
 
                                 <div class="tablenav bottom">
@@ -2299,6 +3212,7 @@ EOT;
                                 ?></li>
                             <li>Кешированных ASN‑файлов: <?php echo count(glob($this->cache_dir . 'asn_*.json')); ?></li>
                             <li>Ваш IP: <strong><?php echo esc_html($current_user_ip); ?></strong></li>
+                            <li>Cloudflare настроен: <?php echo $this->is_cloudflare_configured() ? '<span style="color:green">✓</span>' : '<span style="color:orange">✗ не настроен</span>'; ?></li>
                         </ul>
                     </div>
 
@@ -2313,7 +3227,19 @@ EOT;
                             <li>Блокировка ботов: <?php echo !empty($current_bots) ? '<span style="color:green">✓</span>' : '<span style="color:gray">○ нет</span>'; ?></li>
                             <li>Брутфорс‑защита: <?php echo get_option('asb_brute_force_enabled') ? '<span style="color:green">✓</span>' : '<span style="color:gray">○ нет</span>'; ?></li>
                             <li>Fail2Ban‑лог: <?php echo get_option('asb_fail2ban_enabled') ? '<span style="color:green">✓</span>' : '<span style="color:gray">○ нет</span>'; ?></li>
+                            <li>REST API: <span style="color:green">✓ доступен</span></li>
                         </ul>
+                    </div>
+
+                    <div class="card">
+                        <h3>REST API Endpoints</h3>
+                        <p>Вы можете использовать следующие конечные точки REST API для удаленного управления блокировками:</p>
+                        <ul>
+                            <li><strong>GET /wp-json/asb/v1/list</strong> - Получить список заблокированных IP/ASN.</li>
+                            <li><strong>POST /wp-json/asb/v1/block</strong> - Заблокировать IP/ASN. Требуются параметры: <code>target</code> (IP/ASN), <code>reason</code> (необязательно).</li>
+                            <li><strong>POST /wp-json/asb/v1/unblock</strong> - Разблокировать IP/ASN. Требуется параметр: <code>target</code> (IP/ASN).</li>
+                        </ul>
+                        <p class="description">Для использования требуется аутентификация с правами "manage_options".</p>
                     </div>
 
                     <p>
@@ -2507,10 +3433,499 @@ EOT;
                 var ip = $(this).data('ip');
                 showHistoryModal(ip);
             });
+			
+			/* ========================================================
+               AJAX Пагинация в управлении блокировками
+            ======================================================== */
+            function fetchBlockedIps(page, search) {
+                var $container = $('#blocked-ips-table-container');
+                $container.css('opacity', '0.5'); // Визуальная индикация загрузки
+                
+                $.post(asb_ajax.ajax_url, {
+                    action: 'asb_get_blocked_ips_table',
+                    nonce: asb_ajax.nonce,
+                    page: page,
+                    search: search
+                }, function(response) {
+                    $container.css('opacity', '1');
+                    if (response.success) {
+                        $container.html(response.data.table_html);
+                    } else {
+                        alert('Ошибка загрузки данных');
+                    }
+                }).fail(function() {
+                    $container.css('opacity', '1');
+                    alert('Ошибка соединения с сервером');
+                });
+            }
+
+            // Клик по ссылкам пагинации
+            $(document).on('click', '.tablenav .pagination-links a', function(e){
+                e.preventDefault();
+                var $link = $(this);
+                var page = $link.data('page');
+                if (!page) return;
+                
+                var search = $('#ip-search').val(); // Берем текущее значение поиска
+                fetchBlockedIps(page, search);
+            });
+
+            // AJAX поиск
+            $('#ip-search-form').on('submit', function(e){
+                e.preventDefault();
+                var search = $('#ip-search').val();
+                fetchBlockedIps(1, search); // При поиске всегда переходим на 1 страницу
+            });
+        });
+			
+        </script>
+        <?php
+    }
+
+    /* ==========================================================
+       20. Регистрация настроек Cloudflare
+       ========================================================== */
+
+    public function asb_register_settings() {
+        // Новые настройки Cloudflare
+        register_setting('asb_cloudflare_settings', $this->cf_email_key, ['sanitize_callback' => 'sanitize_email']);
+        register_setting('asb_cloudflare_settings', $this->cf_api_key, ['sanitize_callback' => 'sanitize_text_field']);
+        register_setting('asb_cloudflare_settings', $this->cf_zone_id, ['sanitize_callback' => 'sanitize_text_field']);
+
+        add_settings_section(
+            'asb_cloudflare_section',
+            __('Cloudflare Integration Settings', 'ip-blocker-manager'),
+            null,
+            'asb_cloudflare'
+        );
+
+        add_settings_field(
+            $this->cf_email_key,
+            __('Cloudflare Email', 'ip-blocker-manager'),
+            [$this, 'cf_email_callback'],
+            'asb_cloudflare',
+            'asb_cloudflare_section'
+        );
+        add_settings_field(
+            $this->cf_api_key,
+            __('Cloudflare Global API Key', 'ip-blocker-manager'),
+            [$this, 'cf_api_key_callback'],
+            'asb_cloudflare',
+            'asb_cloudflare_section'
+        );
+        add_settings_field(
+            $this->cf_zone_id,
+            __('Cloudflare Zone ID', 'ip-blocker-manager'),
+            [$this, 'cf_zone_id_callback'],
+            'asb_cloudflare',
+            'asb_cloudflare_section'
+        );
+    }
+    
+    // Callback функции для полей настроек Cloudflare
+    public function cf_email_callback() {
+        $value = get_option($this->cf_email_key);
+        echo "<input type='email' name='{$this->cf_email_key}' value='" . esc_attr($value) . "' class='regular-text' />";
+        echo "<p class='description'>" . __('Email, связанный с вашей учетной записью Cloudflare.', 'ip-blocker-manager') . "</p>";
+    }
+    
+    public function cf_api_key_callback() {
+        $value = get_option($this->cf_api_key);
+        // Не отображаем ключ полностью для безопасности
+        $display_value = $value ? substr($value, 0, 4) . str_repeat('*', 30) : '';
+        echo "<input type='password' name='{$this->cf_api_key}' value='" . esc_attr($value) . "' class='regular-text' />";
+        echo "<p class='description'>" . __('Ваш глобальный ключ API Cloudflare. Будьте осторожны.', 'ip-blocker-manager') . "</p>";
+    }
+    
+    public function cf_zone_id_callback() {
+        $value = get_option($this->cf_zone_id);
+        echo "<input type='text' name='{$this->cf_zone_id}' value='" . esc_attr($value) . "' class='regular-text' />";
+        echo "<p class='description'>" . __('ID зоны сайта в Cloudflare (находится на странице обзора сайта).', 'ip-blocker-manager') . "</p>";
+    }
+
+    /* ==========================================================
+       21. Страница Cloudflare настроек
+       ========================================================== */
+
+    public function cloudflare_settings_page() {
+        if (!current_user_can('manage_options')) return;
+        ?>
+        <div class="wrap">
+            <h1><?php _e('Cloudflare Integration', 'ip-blocker-manager'); ?></h1>
+            <p><?php _e('Интеграция с Cloudflare позволяет управлять правилами брандмауэра Cloudflare, синхронизируя блокировки с плагином.', 'ip-blocker-manager'); ?></p>
+            <form method="post" action="options.php">
+                <?php
+                settings_fields('asb_cloudflare_settings');
+                do_settings_sections('asb_cloudflare');
+                submit_button();
+                ?>
+            </form>
+            <p class="description">
+                <?php _e('Примечание: Используйте глобальный ключ API или токен с правами на редактирование правил брандмауэра зоны.', 'ip-blocker-manager'); ?>
+            </p>
+            <div class="card">
+                <h3>Статус Cloudflare</h3>
+                <p>Интеграция <?php echo $this->is_cloudflare_configured() ? '<span style="color:green">настроена</span>' : '<span style="color:red">не настроена</span>'; ?></p>
+                <p>При блокировке IP через плагин, он будет автоматически добавлен в правила брандмауэра Cloudflare.</p>
+            </div>
+        </div>
+        <?php
+    }
+
+    /* ==========================================================
+       22. Страница аналитики атак - ИСПРАВЛЕННАЯ ВЕРСИЯ
+       ========================================================== */
+
+    /**
+     * Подключение скриптов для страницы аналитики
+     */
+    public function enqueue_analytics_scripts($hook) {
+        // Проверяем, что мы на нужной странице
+        if ($hook !== 'settings_page_asb-analytics') {
+            return;
+        }
+        
+        // Подключаем Chart.js локально или через CDN с fallback
+        wp_enqueue_script(
+            'chart-js',
+            'https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js',
+            [],
+            '4.4.2',
+            true
+        );
+        
+        // Добавляем inline стили для страницы аналитики
+        wp_add_inline_style('wp-admin', '
+            .asb-analytics-container {
+                max-width: 1200px;
+                margin: 20px auto;
+            }
+            .asb-stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 20px;
+                margin-bottom: 30px;
+            }
+            .asb-stat-card {
+                background: #fff;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                text-align: center;
+            }
+            .asb-stat-number {
+                font-size: 2.5em;
+                font-weight: bold;
+                margin: 10px 0;
+            }
+            .asb-stat-label {
+                color: #666;
+                font-size: 0.9em;
+            }
+            .asb-charts-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+                gap: 30px;
+                margin-bottom: 30px;
+            }
+            @media (max-width: 1200px) {
+                .asb-charts-grid {
+                    grid-template-columns: 1fr;
+                }
+            }
+            .asb-chart-container {
+                background: #fff;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            .asb-chart-title {
+                margin-top: 0;
+                margin-bottom: 20px;
+                color: #1d2327;
+            }
+            .asb-chart-wrapper {
+                position: relative;
+                height: 300px;
+                width: 100%;
+            }
+        ');
+    }
+
+    public function analytics_page() {
+        if (!current_user_can('manage_options')) {
+            wp_die(__('У вас недостаточно прав для доступа к этой странице.', 'ip-blocker-manager'));
+        }
+        
+        $data = $this->get_analytics_data();
+        
+        // Проверяем наличие данных для отображения
+        if (empty($data) || !is_array($data)) {
+            $data = [
+                'total_attacks' => 0,
+                'attacks_by_type' => [],
+                'attacks_by_day' => array_fill_keys(array_map(function($i) {
+                    return date('Y-m-d', strtotime("-$i days"));
+                }, range(29, 0)), 0),
+                'blocked_ips_count' => 0,
+                'unique_attackers_count' => 0
+            ];
+        }
+        
+        // Подготавливаем данные для JavaScript
+        $attacks_by_day_labels = array_keys($data['attacks_by_day']);
+        $attacks_by_day_values = array_values($data['attacks_by_day']);
+        
+        $attacks_by_type_labels = array_keys($data['attacks_by_type']);
+        $attacks_by_type_values = array_values($data['attacks_by_type']);
+        ?>
+        <div class="wrap asb-analytics-container">
+            <h1><?php _e('Аналитика атак', 'ip-blocker-manager'); ?></h1>
+            
+            <div class="asb-stats-grid">
+                <div class="asb-stat-card">
+                    <h3><?php _e('Всего атак', 'ip-blocker-manager'); ?></h3>
+                    <div class="asb-stat-number"><?php echo number_format($data['total_attacks']); ?></div>
+                    <div class="asb-stat-label"><?php _e('За все время', 'ip-blocker-manager'); ?></div>
+                </div>
+                
+                <div class="asb-stat-card">
+                    <h3><?php _e('Заблокировано IP', 'ip-blocker-manager'); ?></h3>
+                    <div class="asb-stat-number" style="color: #d63638;"><?php echo number_format($data['blocked_ips_count']); ?></div>
+                    <div class="asb-stat-label"><?php _e('Текущие блокировки', 'ip-blocker-manager'); ?></div>
+                </div>
+                
+                <div class="asb-stat-card">
+                    <h3><?php _e('Уникальных атакующих', 'ip-blocker-manager'); ?></h3>
+                    <div class="asb-stat-number" style="color: #00a32a;"><?php echo number_format($data['unique_attackers_count']); ?></div>
+                    <div class="asb-stat-label"><?php _e('Разные IP-адреса', 'ip-blocker-manager'); ?></div>
+                </div>
+            </div>
+
+            <div class="asb-charts-grid">
+                <div class="asb-chart-container">
+                    <h2 class="asb-chart-title"><?php _e('Атаки за последние 30 дней', 'ip-blocker-manager'); ?></h2>
+                    <div class="asb-chart-wrapper">
+                        <canvas id="asb-attacks-over-time-chart"></canvas>
+                    </div>
+                </div>
+                
+                <div class="asb-chart-container">
+                    <h2 class="asb-chart-title"><?php _e('Распределение по типам атак', 'ip-blocker-manager'); ?></h2>
+                    <div class="asb-chart-wrapper">
+                        <canvas id="asb-attacks-by-type-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="asb-chart-container">
+                <h2 class="asb-chart-title"><?php _e('Детальная статистика', 'ip-blocker-manager'); ?></h2>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead>
+                        <tr>
+                            <th><?php _e('Тип атаки', 'ip-blocker-manager'); ?></th>
+                            <th><?php _e('Количество', 'ip-blocker-manager'); ?></th>
+                            <th><?php _e('Процент', 'ip-blocker-manager'); ?></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php if (empty($attacks_by_type_labels)): ?>
+                            <tr>
+                                <td colspan="3" style="text-align: center;"><?php _e('Нет данных об атаках', 'ip-blocker-manager'); ?></td>
+                            </tr>
+                        <?php else: ?>
+                            <?php 
+                            $total_attacks = array_sum($attacks_by_type_values);
+                            foreach ($attacks_by_type_labels as $index => $type):
+                                $count = $attacks_by_type_values[$index];
+                                $percentage = $total_attacks > 0 ? round(($count / $total_attacks) * 100, 1) : 0;
+                                $type_label = $this->get_attack_type_label($type);
+                            ?>
+                                <tr>
+                                    <td><?php echo esc_html($type_label); ?></td>
+                                    <td><?php echo number_format($count); ?></td>
+                                    <td><?php echo $percentage; ?>%</td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Проверяем, загружен ли Chart.js
+            if (typeof Chart === 'undefined') {
+                console.error('Chart.js не загружен!');
+                alert('Ошибка загрузки библиотеки графиков. Пожалуйста, обновите страницу.');
+                return;
+            }
+            
+            // Данные для графика атак по дням
+            const attacksByDayLabels = <?php echo json_encode($attacks_by_day_labels); ?>;
+            const attacksByDayValues = <?php echo json_encode($attacks_by_day_values); ?>;
+            
+            // Данные для графика атак по типам
+            const attacksByTypeLabels = <?php echo json_encode($attacks_by_type_labels); ?>;
+            const attacksByTypeValues = <?php echo json_encode($attacks_by_type_values); ?>;
+            
+            // Цвета для графиков
+            const chartColors = {
+                blue: 'rgba(54, 162, 235, 0.8)',
+                red: 'rgba(255, 99, 132, 0.8)',
+                green: 'rgba(75, 192, 192, 0.8)',
+                orange: 'rgba(255, 159, 64, 0.8)',
+                purple: 'rgba(153, 102, 255, 0.8)',
+                yellow: 'rgba(255, 205, 86, 0.8)',
+                grey: 'rgba(201, 203, 207, 0.8)'
+            };
+            
+            const typeColors = [
+                chartColors.red,    // login_fail
+                chartColors.blue,   // honeypot
+                chartColors.green,  // geo_block
+                chartColors.orange, // file_access
+                chartColors.purple, // brute_force
+                chartColors.yellow  // other
+            ];
+            
+            // График 1: Атаки по дням
+            const timeCtx = document.getElementById('asb-attacks-over-time-chart');
+            if (timeCtx) {
+                try {
+                    new Chart(timeCtx, {
+                        type: 'line',
+                        data: {
+                            labels: attacksByDayLabels,
+                            datasets: [{
+                                label: '<?php _e('Количество атак', 'ip-blocker-manager'); ?>',
+                                data: attacksByDayValues,
+                                borderColor: chartColors.blue,
+                                backgroundColor: chartColors.blue.replace('0.8', '0.2'),
+                                borderWidth: 2,
+                                tension: 0.3,
+                                fill: true
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: {
+                                    display: true,
+                                    position: 'top'
+                                },
+                                tooltip: {
+                                    mode: 'index',
+                                    intersect: false
+                                }
+                            },
+                            scales: {
+                                y: {
+                                    beginAtZero: true,
+                                    title: {
+                                        display: true,
+                                        text: '<?php _e('Количество атак', 'ip-blocker-manager'); ?>'
+                                    },
+                                    ticks: {
+                                        stepSize: 1
+                                    }
+                                },
+                                x: {
+                                    title: {
+                                        display: true,
+                                        text: '<?php _e('Дата', 'ip-blocker-manager'); ?>'
+                                    }
+                                }
+                            }
+                        }
+                    });
+                } catch (error) {
+                    console.error('Ошибка создания графика атак по дням:', error);
+                    timeCtx.parentElement.innerHTML = '<p style="color: red;">Ошибка создания графика. Пожалуйста, обновите страницу.</p>';
+                }
+            }
+            
+            // График 2: Атаки по типам
+            const typeCtx = document.getElementById('asb-attacks-by-type-chart');
+            if (typeCtx && attacksByTypeLabels.length > 0) {
+                try {
+                    new Chart(typeCtx, {
+                        type: 'pie',
+                        data: {
+                            labels: attacksByTypeLabels.map(label => {
+                                const labelsMap = {
+                                    'login_fail': '<?php _e('Неудачные входы', 'ip-blocker-manager'); ?>',
+                                    'honeypot': '<?php _e('Honeypot', 'ip-blocker-manager'); ?>',
+                                    'geo_block': '<?php _e('Гео-блокировка', 'ip-blocker-manager'); ?>',
+                                    'file_access': '<?php _e('Доступ к файлам', 'ip-blocker-manager'); ?>',
+                                    'brute_force': '<?php _e('Брутфорс', 'ip-blocker-manager'); ?>',
+                                    'other': '<?php _e('Другие', 'ip-blocker-manager'); ?>'
+                                };
+                                return labelsMap[label] || label;
+                            }),
+                            datasets: [{
+                                data: attacksByTypeValues,
+                                backgroundColor: typeColors.slice(0, attacksByTypeLabels.length),
+                                borderColor: '#fff',
+                                borderWidth: 2,
+                                hoverOffset: 10
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: {
+                                    position: 'right',
+                                    labels: {
+                                        padding: 20,
+                                        usePointStyle: true
+                                    }
+                                },
+                                tooltip: {
+                                    callbacks: {
+                                        label: function(context) {
+                                            const label = context.label || '';
+                                            const value = context.raw || 0;
+                                            const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                            const percentage = total > 0 ? Math.round((value / total) * 100) : 0;
+                                            return `${label}: ${value} (${percentage}%)`;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                } catch (error) {
+                    console.error('Ошибка создания графика атак по типам:', error);
+                    typeCtx.parentElement.innerHTML = '<p style="color: red;">Ошибка создания графика. Пожалуйста, обновите страницу.</p>';
+                }
+            } else if (typeCtx) {
+                typeCtx.parentElement.innerHTML = '<p style="text-align: center; color: #666;"><?php _e('Нет данных об атаках для отображения', 'ip-blocker-manager'); ?></p>';
+            }
         });
         </script>
         <?php
     }
+    
+    /**
+     * Получить читаемое название типа атаки
+     */
+    private function get_attack_type_label($type) {
+        $labels = [
+            'login_fail' => __('Неудачные попытки входа', 'ip-blocker-manager'),
+            'honeypot' => __('Активация Honeypot', 'ip-blocker-manager'),
+            'geo_block' => __('Гео-блокировка', 'ip-blocker-manager'),
+            'file_access' => __('Доступ к опасным файлам', 'ip-blocker-manager'),
+            'brute_force' => __('Брутфорс атака', 'ip-blocker-manager'),
+            'other' => __('Другие атаки', 'ip-blocker-manager')
+        ];
+        
+        return $labels[$type] ?? ucfirst(str_replace('_', ' ', $type));
+    }
+
 }
 
 /* ============================================================
