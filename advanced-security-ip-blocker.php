@@ -3,7 +3,7 @@
 Plugin Name: Advanced Security IP Blocker
 Description: Продвинутая система безопасности: блокировка IP, защита wp‑login.php и xmlrpc.php, блокировка опасных файлов и ботов с поддержкой ASN, гео‑блокировки, honeypot‑страниц, интеграция с внешними черными листами, Fail2Ban, Redis, Cloudflare, Аналитикой и REST API.
 Plugin URI: https://github.com/RobertoBennett/IP-Blocker-Manager
-Version: 2.1.0
+Version: 2.2.0 FINAL
 Author: Robert Bennett
 Text Domain: ip-blocker-manager
 */
@@ -12,7 +12,7 @@ defined('ABSPATH') || exit;
 
 // Обновление версии плагина
 if (!defined('ASB_BLOCKER_VERSION')) {
-    define('ASB_BLOCKER_VERSION', '2.1.0');
+    define('ASB_BLOCKER_VERSION', '2.2.0 FINAL');
 }
 
 /* ============================================================
@@ -21,122 +21,139 @@ if (!defined('ASB_BLOCKER_VERSION')) {
 class Advanced_Security_Blocker {
 
     /* ----------------------------------------------------------
-       Основные свойства
-    ---------------------------------------------------------- */
-    private $htaccess_path;
-    private $marker_ip      = '# IP_BLOCKER_SAFE_MARKER';
-    private $marker_login   = '# LOGIN_PROTECTION_MARKER';
-    private $marker_files   = '# DANGEROUS_FILES_MARKER';
-    private $marker_bots    = '# BOT_PROTECTION_MARKER';
-    private $marker_honeypot= '# HONEYPOT_PROTECTION_MARKER';
-    private $marker_nginx   = '# NGINX_RULES_MARKER';
-    private $backup_dir;
-    private $cache_dir;
-    public $log = []; // Сделано public для доступа из REST API
-    private $cache_handler;
-    private $geo_reader;
-    private $redis;
+   Основные свойства
+---------------------------------------------------------- */
+private $htaccess_path;
+private $marker_ip      = '# IP_BLOCKER_SAFE_MARKER';
+private $marker_login   = '# LOGIN_PROTECTION_MARKER';
+private $marker_files   = '# DANGEROUS_FILES_MARKER';
+private $marker_bots    = '# BOT_PROTECTION_MARKER';
+private $marker_honeypot= '# HONEYPOT_PROTECTION_MARKER';
+private $marker_nginx   = '# NGINX_RULES_MARKER';
+// Новый маркер для Myip.ms
+private $marker_myipms  = '# MYIPMS_BLACKLIST_MARKER';
+
+private $backup_dir;
+private $cache_dir;
+public $log = []; // Сделано public для доступа из REST API
+private $cache_handler;
+private $geo_reader;
+private $redis;
+
+// Файл для хранения IP списка Myip.ms в режиме WP
+private $myipms_list_file;
+
+// Ключи настроек Cloudflare
+private $cf_email_key   = 'asb_cloudflare_email';
+private $cf_api_key     = 'asb_cloudflare_api_key';
+private $cf_zone_id     = 'asb_cloudflare_zone_id';
+
+// Ключ для журнала атак
+const ASB_ATTACK_LOG_KEY = 'asb_attack_log';
+
+/* ----------------------------------------------------------
+   Конструктор – регистрация хуков
+---------------------------------------------------------- */
+public function __construct() {
+    $this->htaccess_path = ABSPATH . '.htaccess';
+    $this->backup_dir    = WP_CONTENT_DIR . '/security-blocker-backups/';
+    $this->cache_dir     = WP_CONTENT_DIR . '/security-blocker-cache/';
+    $this->myipms_list_file = WP_CONTENT_DIR . '/asb-myipms-blocked.txt'; // Файл для WP режима
+    $this->cache_handler = new ASB_Cache_Handler();
+
+    // Хуки WordPress
+    add_action('admin_menu',            [$this, 'admin_menu']);
+    add_action('admin_init',            [$this, 'create_backup_dir']);
+    add_action('admin_init',            [$this, 'init_default_settings']);
+    add_action('admin_init',            [$this, 'handle_backup_request']);
+    add_action('admin_init',            [$this, 'handle_cache_clear']);
+    add_action('admin_init',            [$this, 'handle_unblock_request']);
+    add_action('admin_init',            [$this, 'handle_manual_block_request']);
+    add_action('admin_init',            [$this, 'handle_whitelist_request']);
+    add_action('admin_init',            [$this, 'generate_nginx_fragment']);
+    add_action('admin_init',            [$this, 'check_and_create_tables']);
+    add_action('admin_enqueue_scripts', [$this, 'enqueue_scripts']);
     
-    // Ключи настроек Cloudflare
-    private $cf_email_key   = 'asb_cloudflare_email';
-    private $cf_api_key     = 'asb_cloudflare_api_key';
-    private $cf_zone_id     = 'asb_cloudflare_zone_id';
+    // Хук CRON для Myip.ms
+    add_action('asb_myipms_update_event', [$this, 'process_myipms_update']);
 
-    // Ключ для журнала атак
-    const ASB_ATTACK_LOG_KEY = 'asb_attack_log';
+    // Хук для загрузки GeoIP перенесен в admin_init для безопасности
+    add_action('admin_init',            [$this, 'init_geo_reader_download']);
 
-    /* ----------------------------------------------------------
-       Конструктор – регистрация хуков
-    ---------------------------------------------------------- */
-    public function __construct() {
-        $this->htaccess_path = ABSPATH . '.htaccess';
-        $this->backup_dir    = WP_CONTENT_DIR . '/security-blocker-backups/';
-        $this->cache_dir     = WP_CONTENT_DIR . '/security-blocker-cache/';
-        $this->cache_handler = new ASB_Cache_Handler();
+    // Защита от брутфорса
+    add_action('wp_login_failed',       [$this, 'handle_failed_login']);
+    add_action('wp_authenticate_user',  [$this, 'check_blocked_ip'], 10, 2);
+    add_action('init',                  [$this, 'init_brute_force_protection']);
+    add_action('init',                  [$this, 'check_ip_access'], 1);
+    add_action('init',                  [$this, 'honeypot_init']);
+    add_action('template_redirect',     [$this, 'template_redirect']);
 
-        // Хуки WordPress
-        add_action('admin_menu',            [$this, 'admin_menu']);
-        add_action('admin_init',            [$this, 'create_backup_dir']);
-        add_action('admin_init',            [$this, 'init_default_settings']);
-        add_action('admin_init',            [$this, 'handle_backup_request']);
-        add_action('admin_init',            [$this, 'handle_cache_clear']);
-        add_action('admin_init',            [$this, 'handle_unblock_request']);
-        add_action('admin_init',            [$this, 'handle_manual_block_request']);
-        add_action('admin_init',            [$this, 'handle_whitelist_request']);
-        add_action('admin_init',            [$this, 'generate_nginx_fragment']);
-        add_action('admin_init',            [$this, 'check_and_create_tables']);
-        add_action('admin_enqueue_scripts', [$this, 'enqueue_scripts']);
-        
-        // Хук для загрузки GeoIP перенесен в admin_init для безопасности
-        add_action('admin_init',            [$this, 'init_geo_reader_download']);
+    // AJAX‑обработчики
+    add_action('wp_ajax_asb_get_login_stats',       [$this, 'ajax_get_login_stats']);
+    add_action('wp_ajax_asb_get_recent_attempts',   [$this, 'ajax_get_recent_attempts']);
+    add_action('wp_ajax_asb_get_block_history',     [$this, 'ajax_get_block_history']);
+    add_action('wp_ajax_asb_get_blocked_ips_table', [$this, 'ajax_get_blocked_ips_table']);
+	add_action('wp_ajax_asb_batch_block_ip', 		[$this, 'ajax_batch_block_ip']);
+    // AJAX для ручного запуска обновления Myip.ms
+    add_action('wp_ajax_asb_run_myipms_update',     [$this, 'ajax_run_myipms_update']);
 
-        // Защита от брутфорса
-        add_action('wp_login_failed',       [$this, 'handle_failed_login']);
-        add_action('wp_authenticate_user',  [$this, 'check_blocked_ip'], 10, 2);
-        add_action('init',                  [$this, 'init_brute_force_protection']);
-        add_action('init',                  [$this, 'check_ip_access'], 1);
-        add_action('init',                  [$this, 'honeypot_init']);
-        add_action('template_redirect',     [$this, 'template_redirect']);
+    // Таблицы БД
+    register_activation_hook(__FILE__, [$this, 'create_login_attempts_table']);
+    register_activation_hook(__FILE__, [$this, 'create_unblock_history_table']);
 
-        // AJAX‑обработчики
-        add_action('wp_ajax_asb_get_login_stats',       [$this, 'ajax_get_login_stats']);
-        add_action('wp_ajax_asb_get_recent_attempts',   [$this, 'ajax_get_recent_attempts']);
-        add_action('wp_ajax_asb_get_block_history',     [$this, 'ajax_get_block_history']);
-        add_action('wp_ajax_asb_get_blocked_ips_table', [$this, 'ajax_get_blocked_ips_table']);
+    // Деактивация / Удаление
+    register_deactivation_hook(__FILE__, [$this, 'deactivate']);
+    register_uninstall_hook(__FILE__,    [__CLASS__, 'uninstall']);
 
-        // Таблицы БД
-        register_activation_hook(__FILE__, [$this, 'create_login_attempts_table']);
-        register_activation_hook(__FILE__, [$this, 'create_unblock_history_table']);
+    // Инициализация вспомогательных компонентов (только чтение, скачивание - отдельно)
+    $this->init_geo_reader_instance();
+    $this->init_redis_client();
 
-        // Деактивация / Удаление
-        register_deactivation_hook(__FILE__, [$this, 'deactivate']);
-        register_uninstall_hook(__FILE__,    [__CLASS__, 'uninstall']);
+    // REST API
+    add_action('rest_api_init', [$this, 'register_rest_routes']);
 
-        // Инициализация вспомогательных компонентов (только чтение, скачивание - отдельно)
-        $this->init_geo_reader_instance();
-        $this->init_redis_client();
+    // Регистрация настроек Cloudflare
+    add_action('admin_init', [$this, 'asb_register_settings']);
+    
+    // Подключение скриптов для страницы аналитики
+    add_action('admin_enqueue_scripts', [$this, 'enqueue_analytics_scripts']);
+}
 
-        // REST API
-        add_action('rest_api_init', [$this, 'register_rest_routes']);
+/* ==========================================================
+   0. Инициализация и настройки по умолчанию
+   ========================================================== */
 
-        // Регистрация настроек Cloudflare
-        add_action('admin_init', [$this, 'asb_register_settings']);
-        
-        // Подключение скриптов для страницы аналитики
-        add_action('admin_enqueue_scripts', [$this, 'enqueue_analytics_scripts']);
-    }
+public function init_default_settings() {
+    $defaults = [
+        'asb_brute_force_enabled'      => '1',
+        'asb_max_attempts'             => '5',
+        'asb_time_window'              => '15',
+        'asb_block_duration'           => '60',
+        'asb_auto_add_to_htaccess'     => '1',
+        'asb_email_notifications'      => '0',
+        'asb_fail2ban_enabled'         => '0',
+        'asb_external_blacklist'       => '0',
+        'asb_clear_cache_enabled'      => '1',
+        'asb_redis_shared_blocklist'   => '0',
+        'asb_rate_limit_enabled'       => '0',
+        'asb_geo_block_countries'      => '',
+        'asb_telegram_token'           => '',
+        'asb_telegram_chat_id'         => '',
+        'asb_cloudflare_email'         => '',
+        'asb_cloudflare_api_key'       => '',
+        'asb_cloudflare_zone_id'       => '',
+        // Настройки Myip.ms
+        'asb_myipms_enabled'           => '0',
+        'asb_myipms_mode'              => 'htaccess', // 'htaccess' или 'wp'
+        'asb_myipms_last_update'       => 'Никогда'
+    ];
 
-    /* ==========================================================
-       0. Инициализация и настройки по умолчанию
-       ========================================================== */
-
-    public function init_default_settings() {
-        $defaults = [
-            'asb_brute_force_enabled'      => '1',
-            'asb_max_attempts'             => '5',
-            'asb_time_window'              => '15',
-            'asb_block_duration'           => '60',
-            'asb_auto_add_to_htaccess'     => '1',
-            'asb_email_notifications'      => '0',
-            'asb_fail2ban_enabled'         => '0',
-            'asb_external_blacklist'       => '0',
-            'asb_clear_cache_enabled'      => '1',
-            'asb_redis_shared_blocklist'   => '0',
-            'asb_rate_limit_enabled'       => '0',
-            'asb_geo_block_countries'      => '',
-            'asb_telegram_token'           => '',
-            'asb_telegram_chat_id'         => '',
-            'asb_cloudflare_email'         => '',
-            'asb_cloudflare_api_key'       => '',
-            'asb_cloudflare_zone_id'       => ''
-        ];
-
-        foreach ($defaults as $key => $value) {
-            if (get_option($key) === false) {
-                add_option($key, $value);
-            }
+    foreach ($defaults as $key => $value) {
+        if (get_option($key) === false) {
+            add_option($key, $value);
         }
     }
+}
 
     /**
      * Логика скачивания БД GeoIP (вынесена отдельно для безопасности)
@@ -168,14 +185,7 @@ class Advanced_Security_Blocker {
      * Инициализация объекта Reader (только если файл существует)
      */
     private function init_geo_reader_instance() {
-        $db_file = $this->cache_dir . 'GeoLite2-Country.mmdb';
-        if (file_exists($db_file) && class_exists('\MaxMind\Db\Reader')) {
-            try {
-                $this->geo_reader = new \MaxMind\Db\Reader($db_file);
-            } catch (Exception $e) {
-                error_log('ASB: Ошибка инициализации GeoIP reader: ' . $e->getMessage());
-            }
-        }
+        // Локальный Reader больше не используется
     }
 
     private function init_redis_client() {
@@ -361,13 +371,15 @@ class Advanced_Security_Blocker {
        ========================================================== */
 
     public function deactivate() {
-        $this->update_ip_rules('');
-        $this->update_login_protection('', false, false);
-        $this->update_file_protection('');
-        $this->update_bot_protection('');
-        $this->update_honeypot_rules('');
-        $this->remove_nginx_rules();
-    }
+    $this->update_ip_rules('');
+    $this->update_login_protection('', false, false);
+    $this->update_file_protection('');
+    $this->update_bot_protection('');
+    $this->update_honeypot_rules('');
+    $this->clean_myipms_rules(); // Очистка Myip.ms
+    $this->remove_nginx_rules();
+    wp_clear_scheduled_hook('asb_myipms_update_event'); // Удаление крона
+}
 
     public static function uninstall() {
         global $wpdb;
@@ -1258,31 +1270,65 @@ private function is_ip_blocked_at_wp_level($ip) {
        ========================================================== */
 
     /**
-     * Ранняя проверка доступа - САМЫЙ РАННИЙ ХУК
-     * Вызывается ДО загрузки темы и плагинов
-     */
-    public function check_ip_access() {
-        // Пропускаем cron и CLI
-        if (wp_doing_cron() || (defined('WP_CLI') && WP_CLI)) {
-            return;
-        }
-
-        if (!get_option('asb_brute_force_enabled')) {
-            return;
-        }
-
-        $ip = $this->get_user_ip();
-        
-        // Проверяем блокировку
-        $block_status = $this->get_ip_block_status($ip);
-        
-        if ($block_status) {
-            $this->block_access_and_die($ip, $block_status);
-        }
-        
-        // Geo-блокировка
-        $this->check_geo_blocking($ip);
+ * Ранняя проверка доступа - САМЫЙ РАННИЙ ХУК
+ * Вызывается ДО загрузки темы и плагинов
+ */
+public function check_ip_access() {
+    // Пропускаем cron и CLI
+    if (wp_doing_cron() || (defined('WP_CLI') && WP_CLI)) {
+        return;
     }
+
+    if (!get_option('asb_brute_force_enabled')) {
+        return;
+    }
+
+    $ip = $this->get_user_ip();
+    
+    // Проверяем блокировку
+    $block_status = $this->get_ip_block_status($ip);
+    
+    if ($block_status) {
+        $this->block_access_and_die($ip, $block_status);
+    }
+    
+    // Проверка Myip.ms в режиме WP
+    if (get_option('asb_myipms_enabled') === '1' && get_option('asb_myipms_mode') === 'wp') {
+        if ($this->check_myipms_file_block($ip)) {
+            $this->log_attack($ip, 'myipms_blacklist', 'WP Mode Block');
+            $this->block_access_and_die($ip, [
+                'blocked' => true,
+                'type' => 'myipms',
+                'message' => 'Ваш IP находится в черном списке Myip.ms'
+            ]);
+        }
+    }
+
+    // Geo-блокировка
+    $this->check_geo_blocking($ip);
+}
+
+/**
+ * Проверяет IP по локальному файлу Myip.ms (для режима WP)
+ */
+private function check_myipms_file_block($ip) {
+    if (!file_exists($this->myipms_list_file)) return false;
+    
+    // Читаем файл в массив (это может быть ресурсоемко при больших файлах, 
+    // но для myipms списка ~60-100КБ это допустимо)
+    $ips = file($this->myipms_list_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if (!$ips) return false;
+
+    foreach ($ips as $blocked_ip) {
+        $blocked_ip = trim($blocked_ip);
+        if ($blocked_ip === $ip) return true;
+        // Если в списке есть CIDR, проверяем его
+        if (strpos($blocked_ip, '/') !== false && $this->ip_in_cidr($ip, $blocked_ip)) {
+            return true;
+        }
+    }
+    return false;
+}
 
     /**
      * Получить статус блокировки IP (универсальный метод)
@@ -1659,17 +1705,58 @@ private function is_ip_blocked_at_wp_level($ip) {
     }
 
     /* ==========================================================
-       9. GeoIP
+       9. GeoIP (Интеграция ipinfo.io)
        ========================================================== */
 
     private function get_ip_country($ip) {
-        if (!$this->geo_reader) return null;
-        try {
-            $record = $this->geo_reader->get($ip);
-            return $record['country']['iso_code'] ?? null;
-        } catch (Exception $e) {
-            return null;
+        // Ваш API ключ
+        $api_key = 'd3992412cdd465';
+        
+        // 1. Проверяем локальный файловый кеш (чтобы экономить лимиты API и ускорить работу)
+        // Используем хеш IP для имени файла
+        $cache_key = 'geo_ipinfo_' . md5($ip);
+        $cache_file = $this->cache_dir . $cache_key . '.json';
+        
+        if (file_exists($cache_file)) {
+            $cached_content = file_get_contents($cache_file);
+            if ($cached_content) {
+                $data = json_decode($cached_content, true);
+                // Кеш валиден 7 дней (604800 секунд)
+                if (isset($data['timestamp']) && (time() - $data['timestamp']) < 604800) {
+                    return $data['country'] ?? null;
+                }
+            }
         }
+
+        // 2. Если в кеше нет, делаем запрос к API
+        $url = "https://ipinfo.io/{$ip}?token={$api_key}";
+        
+        // Используем существующий в классе метод fetch_url с таймаутом 3 секунды
+        $response = $this->fetch_url($url, 3);
+        
+        if ($response) {
+            $json = json_decode($response, true);
+            
+            // ipinfo возвращает код страны в поле 'country' (напр. "RU", "US")
+            if (isset($json['country'])) {
+                $country = $json['country'];
+                
+                // Сохраняем результат в кеш
+                if (!is_dir($this->cache_dir)) {
+                    wp_mkdir_p($this->cache_dir);
+                }
+                
+                // Записываем данные
+                file_put_contents($cache_file, json_encode([
+                    'timestamp' => time(),
+                    'country'   => $country
+                ]));
+                
+                return $country;
+            }
+        }
+
+        return null;
     }
 
     /* ==========================================================
@@ -2161,6 +2248,965 @@ EOT;
             'pages' => ceil($total / $per_page)
         ];
     }
+	
+	/* ==========================================================
+   Myip.ms Integration Logic (Улучшенная версия с альтернативами)
+   ========================================================== */
+
+public function ajax_run_myipms_update() {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'Нет прав']);
+    check_ajax_referer('asb_ajax_nonce', 'nonce');
+    
+    if (get_option('asb_myipms_enabled') !== '1') {
+        wp_send_json_error(['message' => 'Функция отключена в настройках']);
+    }
+    
+    // Запуск процесса
+    $result = $this->process_myipms_update();
+    
+    if ($result === true) {
+        $log_messages = isset($this->log) ? implode("\n", $this->log) : 'Успешно';
+        wp_send_json_success([
+            'message' => 'Списки Myip.ms успешно обновлены!',
+            'log' => $log_messages
+        ]);
+    } else {
+        wp_send_json_error([
+            'message' => 'Ошибка обновления: ' . $result,
+            'log' => isset($this->log) ? implode("\n", $this->log) : ''
+        ]);
+    }
+}
+
+public function process_myipms_update() {
+    if (get_option('asb_myipms_enabled') !== '1') return 'Disabled';
+
+    $this->log = []; // Очищаем лог для этого запуска
+    $mode = get_option('asb_myipms_mode', 'htaccess');
+    $this->log[] = "Запуск обновления Myip.ms (Режим: $mode) в " . date('Y-m-d H:i:s');
+    
+    // Проверка доступности серверов
+    $this->log[] = "Проверка доступности Myip.ms...";
+    if (!$this->check_myipms_availability()) {
+        $this->log[] = "Myip.ms недоступен, используем альтернативные методы...";
+        return $this->try_alternative_methods($mode);
+    }
+
+    // 1. Основные URL для загрузки
+    $urls = [
+        'https://myip.ms/files/blacklist/htaccess/latest_blacklist.txt',
+        'https://myip.ms/files/blacklist/htaccess/latest_blacklist_users_submitted.txt',
+        // Альтернативные URL на тот же самый список
+        'http://myip.ms/files/blacklist/htaccess/latest_blacklist.txt',
+        'https://myip.ms/files/blacklist/csf/latest_blacklist.txt',
+        'https://myip.ms/files/blacklist/apache_deny/latest_blacklist.txt'
+    ];
+
+    $all_data = '';
+    $success_count = 0;
+    
+    foreach ($urls as $index => $url) {
+        $this->log[] = "Попытка $index: $url";
+        $data = $this->myipms_fetch_and_validate($url);
+        
+        if ($data !== false && !empty(trim($data))) {
+            $all_data .= trim($data) . "\n";
+            $success_count++;
+            $this->log[] = "✓ Данные получены с $url";
+            
+            // Если получили достаточно данных, можно остановиться
+            if ($success_count >= 2) {
+                break;
+            }
+        } else {
+            $this->log[] = "✗ Не удалось получить данные с $url";
+        }
+        
+        // Небольшая пауза между запросами
+        if ($index < count($urls) - 1) {
+            sleep(1);
+        }
+    }
+
+    // Если не получили данные обычным способом
+    if (empty(trim($all_data))) {
+        $this->log[] = "Обычные методы не сработали, пробуем прямой cURL...";
+        $all_data = $this->try_direct_fetch_methods();
+    }
+    
+    // Если все еще нет данных, пробуем альтернативные источники
+    if (empty(trim($all_data))) {
+        $this->log[] = "Пробуем альтернативные источники...";
+        $all_data = $this->fetch_from_alternative_sources();
+    }
+
+    // Если совсем нет данных
+    if (empty(trim($all_data))) {
+        $err = 'Не удалось получить данные ни с одного источника';
+        $this->log[] = $err;
+        // Пробуем использовать кэшированные данные
+        return $this->use_cached_data_if_available($mode);
+    }
+
+    // 2. Обработка в зависимости от режима
+    try {
+        $this->log[] = "Обработка " . count(explode("\n", $all_data)) . " строк данных...";
+        
+        if ($mode === 'htaccess') {
+            // В режиме .htaccess удаляем файл кеша WP, чтобы не занимал место
+            if (file_exists($this->myipms_list_file)) {
+                @unlink($this->myipms_list_file);
+                $this->log[] = "Файл кеша удален";
+            }
+            
+            $result = $this->update_myipms_htaccess($all_data);
+            if ($result !== true) throw new Exception($result);
+            
+        } elseif ($mode === 'wp') {
+            // В режиме WP удаляем правила из .htaccess
+            $this->clean_myipms_rules(true); 
+            
+            $result = $this->update_myipms_file($all_data);
+            if ($result !== true) throw new Exception($result);
+        }
+        
+        // Сохраняем данные в кэш на будущее
+        $this->save_to_cache($all_data);
+        
+        update_option('asb_myipms_last_update', current_time('mysql'));
+        update_option('asb_myipms_last_count', count(array_filter(explode("\n", $all_data), function($line) {
+            return strpos($line, 'Deny from') === 0;
+        })));
+        
+        $this->log[] = 'Обновление Myip.ms завершено успешно!';
+        $this->log[] = 'Время выполнения: ' . timer_stop(0) . ' сек.';
+        
+        return true;
+
+    } catch (Exception $e) {
+        $this->log[] = 'Критическая ошибка: ' . $e->getMessage();
+        
+        // Пробуем откатиться к кэшированным данным
+        $this->log[] = 'Пробуем восстановить из кэша...';
+        $cache_result = $this->use_cached_data_if_available($mode);
+        
+        if ($cache_result === true) {
+            $this->log[] = 'Успешно восстановлено из кэша';
+            return true;
+        }
+        
+        return $e->getMessage();
+    }
+}
+
+private function check_myipms_availability() {
+    // Проверяем несколько способов доступности
+    
+    // Способ 1: DNS проверка
+    if (!gethostbyname('myip.ms')) {
+        $this->log[] = "DNS myip.ms не разрешается";
+        return false;
+    }
+    
+    // Способ 2: Быстрый HTTP HEAD запрос
+    $test_urls = [
+        'https://myip.ms',
+        'http://myip.ms',
+        'https://myip.ms/files/blacklist/'
+    ];
+    
+    foreach ($test_urls as $test_url) {
+        $args = [
+            'timeout' => 5,
+            'sslverify' => false,
+            'method' => 'HEAD'
+        ];
+        
+        $response = wp_remote_head($test_url, $args);
+        
+        if (!is_wp_error($response)) {
+            $code = wp_remote_retrieve_response_code($response);
+            $this->log[] = "Проверка $test_url: HTTP $code";
+            
+            if ($code == 200 || $code == 301 || $code == 302) {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+private function myipms_fetch_and_validate($url) {
+    $this->log[] = "Загрузка: " . parse_url($url, PHP_URL_HOST);
+    
+    // Пробуем разные методы
+    $methods = [
+        'wp_remote_get_ssl_false',
+        'wp_remote_get_ssl_true',
+        'curl_direct',
+        'file_get_contents'
+    ];
+    
+    foreach ($methods as $method) {
+        $this->log[] = "  Метод: $method";
+        
+        switch ($method) {
+            case 'wp_remote_get_ssl_false':
+                $args = [
+                    'timeout' => 15,
+                    'sslverify' => false,
+                    'redirection' => 5,
+                    'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'headers' => [
+                        'Accept' => 'text/plain,text/html,application/xhtml+xml',
+                        'Accept-Language' => 'en-US,en;q=0.9',
+                        'Accept-Encoding' => 'gzip, deflate',
+                        'Cache-Control' => 'no-cache',
+                        'Connection' => 'keep-alive',
+                        'Pragma' => 'no-cache'
+                    ]
+                ];
+                $response = wp_remote_get($url, $args);
+                break;
+                
+            case 'wp_remote_get_ssl_true':
+                $args['sslverify'] = true;
+                $args['timeout'] = 20;
+                $response = wp_remote_get($url, $args);
+                break;
+                
+            case 'curl_direct':
+                $response = $this->curl_fetch_direct($url);
+                break;
+                
+            case 'file_get_contents':
+                $response = $this->file_get_contents_fetch($url);
+                break;
+        }
+        
+        if ($method == 'curl_direct' || $method == 'file_get_contents') {
+            if ($response !== false) {
+                $content = $response;
+                $code = 200;
+            } else {
+                continue;
+            }
+        } else {
+            if (is_wp_error($response)) {
+                $this->log[] = "    Ошибка: " . $response->get_error_message();
+                continue;
+            }
+            
+            $code = wp_remote_retrieve_response_code($response);
+            $content = wp_remote_retrieve_body($response);
+            
+            if ($code !== 200) {
+                $this->log[] = "    HTTP код: $code";
+                continue;
+            }
+        }
+        
+        // Проверяем содержимое
+        if (empty($content)) {
+            $this->log[] = "    Пустой ответ";
+            continue;
+        }
+        
+        $size = strlen($content);
+        $this->log[] = "    Получено: " . $size . " байт";
+        
+        // Проверяем, что это действительно blacklist
+        if (strpos($content, 'Deny from') !== false || 
+            strpos($content, 'myip.ms') !== false ||
+            preg_match('/[0-9a-fA-F:]{2,}/', $content)) { // Исправлена проверка для IPv6
+            
+            $validated = $this->validate_and_parse_content($content);
+            if ($validated !== false) {
+                $this->log[] = "    ✓ Валидация успешна";
+                return $validated;
+            }
+        } else {
+            $this->log[] = "    Не похоже на blacklist";
+            // Сохраняем для отладки
+            file_put_contents(WP_CONTENT_DIR . '/debug_myipms_' . time() . '.txt', $content);
+        }
+    }
+    
+    return false;
+}
+
+private function curl_fetch_direct($url) {
+    if (!function_exists('curl_init')) {
+        $this->log[] = "cURL не доступен";
+        return false;
+    }
+    
+    $ch = curl_init();
+    
+    $options = [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 25,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        CURLOPT_ENCODING => 'gzip, deflate',
+        CURLOPT_HTTPHEADER => [
+            'Accept: text/plain,text/html,application/xhtml+xml',
+            'Accept-Language: en-US,en;q=0.9',
+            'Cache-Control: no-cache',
+            'Pragma: no-cache'
+        ],
+        CURLOPT_HEADER => false,
+        CURLOPT_FAILONERROR => true
+    ];
+    
+    // Пробуем разные SSL варианты
+    static $ssl_try = 0;
+    if ($ssl_try++ % 2 == 0) {
+        $options[CURLOPT_SSL_VERIFYPEER] = true;
+        $options[CURLOPT_SSL_VERIFYHOST] = 2;
+    }
+    
+    curl_setopt_array($ch, $options);
+    
+    $content = curl_exec($ch);
+    
+    if (curl_errno($ch)) {
+        $this->log[] = "cURL ошибка: " . curl_error($ch);
+        curl_close($ch);
+        return false;
+    }
+    
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    
+    if ($http_code !== 200) {
+        $this->log[] = "cURL HTTP код: $http_code";
+        return false;
+    }
+    
+    return $content;
+}
+
+private function file_get_contents_fetch($url) {
+    // Пробуем file_get_contents с контекстом
+    $context_options = [
+        'http' => [
+            'method' => 'GET',
+            'timeout' => 15,
+            'user_agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'header' => "Accept: text/plain\r\n"
+        ],
+        'ssl' => [
+            'verify_peer' => false,
+            'verify_peer_name' => false
+        ]
+    ];
+    
+    $context = stream_context_create($context_options);
+    
+    // Пробуем обернуть в try-catch
+    try {
+        $content = @file_get_contents($url, false, $context);
+        return $content !== false ? $content : false;
+    } catch (Exception $e) {
+        $this->log[] = "file_get_contents ошибка: " . $e->getMessage();
+        return false;
+    }
+}
+
+private function validate_and_parse_content($content) {
+    $lines = explode("\n", $content);
+    $valid_lines = [];
+    $ip_count = 0;
+    $comment_count = 0;
+    
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if (empty($line)) continue;
+        
+        // Разные форматы Myip.ms
+        // UPDATED: Добавлена поддержка IPv6 символов (двоеточие и hex) в регулярное выражение
+        if (preg_match('/^Deny from\s+([0-9a-fA-F\.\/:]+)/i', $line, $matches)) {
+            $valid_lines[] = "Deny from " . trim($matches[1]);
+            $ip_count++;
+        }
+        // Просто IP/CIDR (IPv4)
+        elseif (preg_match('/^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(\/[0-9]{1,2})?)$/', $line, $matches)) {
+            $valid_lines[] = "Deny from " . $matches[1];
+            $ip_count++;
+        }
+        // IPv6 (простая проверка)
+        elseif (strpos($line, ':') !== false && preg_match('/^([0-9a-fA-F:\/]+)$/i', $line, $matches)) {
+            // Простейшая проверка, что это похоже на IP
+            if (strpos($line, ':') !== false && strlen($line) > 2) {
+                $valid_lines[] = "Deny from " . trim($matches[1]);
+                $ip_count++;
+            }
+        }
+        // Формат: 1.2.3.4/24 # комментарий или IPv6 # комментарий
+        // UPDATED: Добавлена поддержка IPv6
+        elseif (preg_match('/^([0-9a-fA-F\.\/:]+)\s*#/', $line, $matches)) {
+            $valid_lines[] = "Deny from " . trim($matches[1]);
+            $ip_count++;
+        }
+        // Комментарии сохраняем
+        elseif (strpos($line, '#') === 0 || strpos($line, '//') === 0 || strpos($line, '##') === 0) {
+            $valid_lines[] = $line;
+            $comment_count++;
+        }
+        // Пропускаем HTML теги если они есть
+        elseif (strpos($line, '<') === false && strpos($line, '>') === false) {
+            // Пробуем найти IPv4 в строке
+            if (preg_match('/(\d+\.\d+\.\d+\.\d+(?:\/\d+)?)/', $line, $matches)) {
+                $valid_lines[] = "Deny from " . $matches[1];
+                $ip_count++;
+            }
+            // Пробуем найти IPv6 в строке (эвристика: группы hex с двоеточиями)
+            elseif (preg_match('/([0-9a-fA-F]{1,4}:){2,}[0-9a-fA-F:\/]+/', $line, $matches)) {
+                 $valid_lines[] = "Deny from " . $matches[0];
+                 $ip_count++;
+            }
+        }
+    }
+    
+    $this->log[] = "Найдено IP: $ip_count, комментариев: $comment_count";
+    
+    if ($ip_count > 0) {
+        return implode("\n", $valid_lines);
+    }
+    
+    // Если не нашли IP, но есть контент, возможно другой формат
+    if (!empty($content) && strlen($content) > 100) {
+        $this->log[] = "Контент получен, но не распознан. Сохраняем для анализа.";
+        file_put_contents(WP_CONTENT_DIR . '/myipms_raw_' . time() . '.txt', $content);
+    }
+    
+    return false;
+}
+
+private function try_direct_fetch_methods() {
+    $this->log[] = "Прямой сбор данных с Myip.ms...";
+    
+    // Попробуем получить со страницы списков
+    $methods = [
+        'https://myip.ms/files/blacklist/general/latest_blacklist.txt',
+        'https://myip.ms/files/blacklist/csf/latest_blacklist.txt',
+        'https://myip.ms/files/blacklist/apache_deny/latest_blacklist.txt'
+    ];
+    
+    $all_data = '';
+    
+    foreach ($methods as $url) {
+        $this->log[] = "Прямая загрузка: $url";
+        
+        // Используем cURL с более агрессивными настройками
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            CURLOPT_ENCODING => 'gzip, deflate',
+            CURLOPT_HTTPHEADER => [
+                'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language: en-US,en;q=0.5',
+                'Connection: keep-alive',
+                'Upgrade-Insecure-Requests: 1',
+                'Cache-Control: max-age=0'
+            ],
+            CURLOPT_COOKIEJAR => '/tmp/myipms_cookie.txt',
+            CURLOPT_COOKIEFILE => '/tmp/myipms_cookie.txt'
+        ]);
+        
+        $content = curl_exec($ch);
+        
+        if (!curl_errno($ch)) {
+            $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            if ($http_code == 200) {
+                $parsed = $this->validate_and_parse_content($content);
+                if ($parsed !== false) {
+                    $all_data .= $parsed . "\n";
+                    $this->log[] = "✓ Прямая загрузка успешна";
+                }
+            }
+        }
+        
+        curl_close($ch);
+        
+        if (!empty($all_data)) {
+            break;
+        }
+    }
+    
+    return $all_data;
+}
+
+private function fetch_from_alternative_sources() {
+    $this->log[] = "Используем альтернативные источники...";
+    
+    $alternative_sources = [
+        [
+            'url' => 'https://www.badips.com/get/list/any/1',
+            'format' => 'ip_only'
+        ],
+        [
+            'url' => 'https://lists.blocklist.de/lists/apache.txt',
+            'format' => 'ip_only'
+        ],
+        [
+            'url' => 'https://www.spamhaus.org/drop/drop.txt',
+            'format' => 'spamhaus'
+        ],
+        [
+            'url' => 'https://www.spamhaus.org/drop/edrop.txt',
+            'format' => 'spamhaus'
+        ],
+        [
+            'url' => 'https://feodotracker.abuse.ch/downloads/ipblocklist.txt',
+            'format' => 'ip_only'
+        ],
+        [
+            'url' => 'https://check.torproject.org/torbulkexitlist',
+            'format' => 'ip_only'
+        ]
+    ];
+    
+    $all_ips = [];
+    $source_count = 0;
+    
+    foreach ($alternative_sources as $source) {
+        $this->log[] = "Альтернативный источник: " . parse_url($source['url'], PHP_URL_HOST);
+        
+        $args = [
+            'timeout' => 15,
+            'sslverify' => false,
+            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ];
+        
+        $response = wp_remote_get($source['url'], $args);
+        
+        if (is_wp_error($response)) {
+            $this->log[] = "  Ошибка: " . $response->get_error_message();
+            continue;
+        }
+        
+        $code = wp_remote_retrieve_response_code($response);
+        if ($code !== 200) {
+            $this->log[] = "  HTTP код: $code";
+            continue;
+        }
+        
+        $content = wp_remote_retrieve_body($response);
+        
+        if (empty($content)) {
+            continue;
+        }
+        
+        $ips = $this->parse_alternative_source($content, $source['format']);
+        if (!empty($ips)) {
+            $all_ips = array_merge($all_ips, $ips);
+            $source_count++;
+            $this->log[] = "  ✓ Добавлено " . count($ips) . " IP";
+        }
+        
+        if ($source_count >= 2) {
+            break; // Достаточно источников
+        }
+        
+        sleep(1); // Пауза между запросами
+    }
+    
+    if (!empty($all_ips)) {
+        $all_ips = array_unique($all_ips);
+        $result = "# Blacklist from alternative sources (" . date('Y-m-d') . ")\n";
+        $result .= "# Total IPs: " . count($all_ips) . "\n";
+        
+        foreach ($all_ips as $ip) {
+            $result .= "Deny from $ip\n";
+        }
+        
+        $this->log[] = "Альтернативные источники: собрано " . count($all_ips) . " уникальных IP";
+        return $result;
+    }
+    
+    return '';
+}
+
+private function parse_alternative_source($content, $format) {
+    $ips = [];
+    $lines = explode("\n", $content);
+    
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if (empty($line) || strpos($line, '#') === 0) {
+            continue;
+        }
+        
+        switch ($format) {
+            case 'ip_only':
+                // UPDATED: Добавлена поддержка IPv6
+                if (preg_match('/^([0-9a-fA-F\.\/:]+)$/', $line, $matches)) {
+                    $ips[] = $matches[1];
+                }
+                break;
+                
+            case 'spamhaus':
+                // UPDATED: Добавлена поддержка IPv6
+                if (preg_match('/^([0-9a-fA-F\.\/:]+)\s*;\s*S/', $line, $matches)) {
+                    $ips[] = $matches[1];
+                }
+                break;
+                
+            default:
+                // Пробуем найти любой IP/CIDR (включая IPv6)
+                if (preg_match('/([0-9a-fA-F\.\/:]+)/', $line, $matches)) {
+                    // Базовая валидация длины, чтобы не цеплять мусор
+                    if(strlen($matches[1]) >= 7) {
+                         $ips[] = $matches[1];
+                    }
+                }
+        }
+    }
+    
+    return $ips;
+}
+
+private function use_cached_data_if_available($mode) {
+    $cache_file = WP_CONTENT_DIR . '/uploads/myipms_cache.txt';
+    $backup_file = WP_CONTENT_DIR . '/uploads/myipms_backup.txt';
+    
+    // Пробуем основной кэш
+    if (file_exists($cache_file) && filesize($cache_file) > 100) {
+        $cache_time = filemtime($cache_file);
+        $age = time() - $cache_time;
+        
+        if ($age < 604800) { // Не старше 7 дней
+            $cached_data = file_get_contents($cache_file);
+            $this->log[] = "Используем кэшированные данные (возраст: " . floor($age/3600) . " часов)";
+            
+            try {
+                if ($mode === 'htaccess') {
+                    $this->update_myipms_htaccess($cached_data);
+                } else {
+                    $this->update_myipms_file($cached_data);
+                }
+                
+                $this->log[] = "Система восстановлена из кэша";
+                return true;
+            } catch (Exception $e) {
+                $this->log[] = "Ошибка восстановления из кэша: " . $e->getMessage();
+            }
+        }
+    }
+    
+    // Пробуем backup
+    if (file_exists($backup_file) && filesize($backup_file) > 100) {
+        $cached_data = file_get_contents($backup_file);
+        $this->log[] = "Используем backup данные";
+        
+        try {
+            if ($mode === 'htaccess') {
+                $this->update_myipms_htaccess($cached_data);
+            } else {
+                $this->update_myipms_file($cached_data);
+            }
+            
+            $this->log[] = "Система восстановлена из backup";
+            return true;
+        } catch (Exception $e) {
+            $this->log[] = "Ошибка восстановления из backup: " . $e->getMessage();
+        }
+    }
+    
+    return "Нет доступных данных (ни онлайн, ни в кэше)";
+}
+
+private function save_to_cache($data) {
+    $cache_file = WP_CONTENT_DIR . '/uploads/myipms_cache.txt';
+    $backup_file = WP_CONTENT_DIR . '/uploads/myipms_backup.txt';
+    
+    // Создаем директорию если нужно
+    $upload_dir = WP_CONTENT_DIR . '/uploads';
+    if (!file_exists($upload_dir)) {
+        mkdir($upload_dir, 0755, true);
+    }
+    
+    // Сохраняем в кэш
+    if (file_put_contents($cache_file, $data) !== false) {
+        $this->log[] = "Данные сохранены в кэш: " . basename($cache_file);
+    }
+    
+    // Делаем backup раз в день
+    if (!file_exists($backup_file) || (time() - filemtime($backup_file)) > 86400) {
+        copy($cache_file, $backup_file);
+        $this->log[] = "Backup создан";
+    }
+}
+
+private function update_myipms_htaccess($content) {
+    if (!file_exists($this->htaccess_path)) {
+        // Создаем .htaccess если его нет
+        file_put_contents($this->htaccess_path, "# WordPress\n");
+    }
+    
+    if (!is_writable($this->htaccess_path)) {
+        // Пробуем изменить права
+        @chmod($this->htaccess_path, 0644);
+        
+        if (!is_writable($this->htaccess_path)) {
+            throw new Exception('.htaccess недоступен для записи. Права: ' . decoct(fileperms($this->htaccess_path)));
+        }
+    }
+
+    $htaccess = file_get_contents($this->htaccess_path);
+    if ($htaccess === false) {
+        throw new Exception('Не удалось прочитать .htaccess');
+    }
+    
+    // Удаляем старый блок (используем более надежный паттерн)
+    $pattern = '/\n?' . preg_quote($this->marker_myipms, '/') . '.*?' . preg_quote($this->marker_myipms, '/') . '/s';
+    $htaccess = preg_replace($pattern, '', $htaccess);
+    
+    // Формируем новый блок
+    $block = "\n{$this->marker_myipms}\n";
+    $block .= "# Myip.ms Blacklist Auto Update (" . date('Y-m-d H:i:s') . ")\n";
+    $block .= "# Generated by Anti-Spam Bot\n";
+    $block .= $content;
+    $block .= "\n{$this->marker_myipms}\n";
+    
+    // Вставляем блок после RewriteEngine On если есть
+    if (strpos($htaccess, 'RewriteEngine On') !== false) {
+        $htaccess = preg_replace(
+            '/(RewriteEngine On\s*)/',
+            "$1\n" . $block,
+            $htaccess
+        );
+    } else {
+        // Или в начало файла
+        $htaccess = $block . $htaccess;
+    }
+    
+    // Создаем backup .htaccess
+    $backup_path = $this->htaccess_path . '.backup_' . date('Ymd');
+    if (!file_exists($backup_path)) {
+        copy($this->htaccess_path, $backup_path);
+    }
+    
+    if (file_put_contents($this->htaccess_path, $htaccess) === false) {
+        throw new Exception('Не удалось записать в .htaccess');
+    }
+
+    $this->log[] = '.htaccess успешно обновлен (' . strlen($htaccess) . ' байт)';
+    return true;
+}
+
+private function update_myipms_file($raw_content) {
+    // Проверка прав на директорию
+    $dir = dirname($this->myipms_list_file);
+    if (!file_exists($dir)) {
+        if (!mkdir($dir, 0755, true)) {
+            throw new Exception('Не удалось создать директорию для файла кеша');
+        }
+    }
+
+    $lines = explode("\n", $raw_content);
+    $clean_ips = [];
+    
+    foreach ($lines as $line) {
+        // Парсим только IP/CIDR из строк "Deny from X.X.X.X"
+        // UPDATED: Регулярное выражение теперь захватывает и IPv6
+        if (preg_match('/^Deny from\s+([0-9a-fA-F\.\/:]+)/i', trim($line), $matches)) {
+            $clean_ips[] = trim($matches[1]);
+        }
+    }
+    
+    if (!empty($clean_ips)) {
+        $clean_ips = array_unique($clean_ips);
+        $content = implode("\n", $clean_ips);
+        $result = file_put_contents($this->myipms_list_file, $content);
+        
+        if ($result === false) {
+            throw new Exception('Не удалось записать в файл: ' . $this->myipms_list_file . '. Проверьте права доступа.');
+        }
+        
+        $this->log[] = 'Файл списка WP обновлен. Записей: ' . count($clean_ips);
+        return true;
+    } else {
+        $this->log[] = 'Предупреждение: Не найдено валидных IP для записи в файл.';
+        return false;
+    }
+}
+
+private function clean_myipms_rules($htaccess_only = false) {
+    // Очистка .htaccess
+    if (file_exists($this->htaccess_path) && is_readable($this->htaccess_path)) {
+        $htaccess = file_get_contents($this->htaccess_path);
+        $pattern = '/\n?' . preg_quote($this->marker_myipms, '/') . '.*?' . preg_quote($this->marker_myipms, '/') . '/s';
+        
+        if (preg_match($pattern, $htaccess)) {
+            $htaccess = preg_replace($pattern, '', $htaccess);
+            if (file_put_contents($this->htaccess_path, $htaccess) !== false) {
+                $this->log[] = 'Правила Myip.ms удалены из .htaccess';
+            }
+        }
+    }
+    
+    // Очистка файла кеша (только если не запрошена очистка только htaccess)
+    if (!$htaccess_only) {
+        if (file_exists($this->myipms_list_file)) {
+            if (@unlink($this->myipms_list_file)) {
+                $this->log[] = 'Файл кеша Myip.ms удален';
+            }
+        }
+    }
+}
+
+private function try_alternative_methods($mode) {
+    $this->log[] = "Пробуем обходные методы...";
+    
+    // Метод 1: Через proxy если есть
+    $proxy_data = $this->fetch_via_proxy();
+    if (!empty($proxy_data)) {
+        $this->log[] = "Получено данных через proxy";
+        return $this->process_alternative_data($proxy_data, $mode);
+    }
+    
+    // Метод 2: Генерация на основе старых данных
+    $generated_data = $this->generate_based_on_history();
+    if (!empty($generated_data)) {
+        $this->log[] = "Сгенерировано на основе истории";
+        return $this->process_alternative_data($generated_data, $mode);
+    }
+    
+    return "Все методы не сработали";
+}
+
+private function fetch_via_proxy() {
+    // Список публичных proxy (осторожно, они могут быть медленными)
+    $proxies = [
+        'https://corsproxy.io/?',
+        'https://api.allorigins.win/raw?url=',
+        'https://cors-anywhere.herokuapp.com/'
+    ];
+    
+    $target_url = urlencode('https://myip.ms/files/blacklist/htaccess/latest_blacklist.txt');
+    
+    foreach ($proxies as $proxy) {
+        $url = $proxy . $target_url;
+        $this->log[] = "Пробуем proxy: " . parse_url($proxy, PHP_URL_HOST);
+        
+        $response = wp_remote_get($url, ['timeout' => 20, 'sslverify' => false]);
+        
+        if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) == 200) {
+            $content = wp_remote_retrieve_body($response);
+            if (!empty($content)) {
+                return $this->validate_and_parse_content($content);
+            }
+        }
+        
+        sleep(1);
+    }
+    
+    return '';
+}
+
+private function generate_based_on_history() {
+    // Генерируем базовый список на основе известных плохих IP
+    $basic_ips = [
+        // Известные спам-сети и ботнеты
+        '1.0.0.0/8',
+        '2.0.0.0/8',
+        '5.0.0.0/8',
+        '45.0.0.0/8',
+        '46.0.0.0/8',
+        '77.0.0.0/8',
+        '78.0.0.0/8',
+        '79.0.0.0/8',
+        '89.0.0.0/8',
+        '93.0.0.0/8',
+        '109.0.0.0/8',
+        '176.0.0.0/8',
+        '178.0.0.0/8',
+        '185.0.0.0/8',
+        '188.0.0.0/8',
+        '193.0.0.0/8',
+        '194.0.0.0/8',
+        '195.0.0.0/8',
+        '212.0.0.0/8',
+        '213.0.0.0/8',
+        '217.0.0.0/8'
+    ];
+    
+    $result = "# Экстренный blacklist (сгенерирован " . date('Y-m-d') . ")\n";
+    $result .= "# Myip.ms недоступен, используем базовую защиту\n";
+    
+    foreach ($basic_ips as $ip) {
+        $result .= "Deny from $ip\n";
+    }
+    
+    return $result;
+}
+
+private function process_alternative_data($data, $mode) {
+    try {
+        if ($mode === 'htaccess') {
+            $this->update_myipms_htaccess($data);
+        } else {
+            $this->update_myipms_file($data);
+        }
+        
+        update_option('asb_myipms_last_update', current_time('mysql'));
+        update_option('asb_myipms_source', 'alternative_' . date('Ymd'));
+        
+        $this->log[] = 'Обновлено из альтернативных источников';
+        $this->save_to_cache($data);
+        
+        return true;
+    } catch (Exception $e) {
+        return $e->getMessage();
+    }
+}
+	
+		/* ----------------------------------------------------------
+       Новый AJAX-обработчик для массовой блокировки
+    ---------------------------------------------------------- */
+    public function ajax_batch_block_ip() {
+        // Проверка прав и nonce
+        if (!current_user_can('manage_options')) wp_send_json_error('Unauthorized');
+        check_ajax_referer('asb_ajax_nonce', 'nonce');
+
+        $ip = sanitize_text_field($_POST['ip'] ?? '');
+        $reason = sanitize_text_field($_POST['reason'] ?? '');
+
+        if (empty($ip)) {
+            wp_send_json_error(['message' => 'Пустой IP']);
+        }
+
+        if (!$this->validate_ip_entry($ip)) {
+            wp_send_json_error(['message' => "Некорректный формат: $ip"]);
+        }
+
+        // Блокируем
+        $result = $this->block_ip_wordpress_only($ip, '(ручная блокировка WordPress)', $reason);
+
+        if ($result) {
+            wp_send_json_success(['message' => "Заблокирован: $ip"]);
+        } else {
+            // Если block_ip_wordpress_only вернул false (например, дубль)
+            wp_send_json_success(['message' => "Пропущен (уже есть или ошибка): $ip"]);
+        }
+    }
 
     /* ==========================================================
    14. Обработчики форм и запросов
@@ -2640,7 +3686,7 @@ public function generate_nginx_fragment() {
         return $data;
     }
 
-    /* ==========================================================
+/* ==========================================================
        19. Страница настроек (основная UI)
        ========================================================== */
 
@@ -2775,17 +3821,20 @@ public function generate_nginx_fragment() {
             <?php $this->output_admin_styles(); ?>
 
             <div class="security-tabs">
-                <div class="security-tab-nav">
-                    <button data-tab="tab-ip-blocking" class="active">Блокировка IP</button>
-                    <button data-tab="tab-login-protection">Защита wp-login/xmlrpc</button>
-                    <button data-tab="tab-file-protection">Блокировка файлов</button>
-                    <button data-tab="tab-bot-protection">Защита от ботов</button>
-                    <button data-tab="tab-brute-force">Брутфорс‑защита</button>
-                    <button data-tab="tab-manage-blocks">Управление блокировками</button>
-                    <button data-tab="tab-whitelist">Белый список</button>
-                    <button data-tab="tab-status">Статус</button>
-                    <button data-tab="tab-telegram">Telegram‑уведомления</button>
-                </div>
+            <div class="security-tab-nav">
+                <button data-tab="tab-ip-blocking" class="active">Блокировка IP</button>
+                <button data-tab="tab-login-protection">Защита wp-login/xmlrpc</button>
+                <button data-tab="tab-file-protection">Блокировка файлов</button>
+                <button data-tab="tab-bot-protection">Защита от ботов</button>
+                <button data-tab="tab-brute-force">Брутфорс‑защита</button>
+                <button data-tab="tab-myipms">Myip.ms Blacklist</button> <!-- НОВАЯ ВКЛАДКА -->
+                <button data-tab="tab-manage-blocks">Управление блокировками</button>
+                <button data-tab="tab-whitelist">Белый список</button>
+                <button data-tab="tab-status">Статус</button>
+                <button data-tab="tab-telegram">Telegram‑уведомления</button>
+            </div>
+
+            <!-- 1. IP‑блокировка -->
 
                 <!-- 1. IP‑блокировка -->
                 <div id="tab-ip-blocking" class="security-tab-content active">
@@ -2994,6 +4043,102 @@ public function generate_nginx_fragment() {
                         </tbody>
                     </table>
                 </div>
+				
+				<!-- 5a. Myip.ms Blacklist -->
+            <div id="tab-myipms" class="security-tab-content">
+                <h2>Интеграция с Myip.ms Blacklist</h2>
+                <p>Автоматическая загрузка и блокировка IP из черных списков Myip.ms. Обновляется ежечасно.</p>
+                
+                <?php
+                // Обработка сохранения настроек Myip.ms
+                if (isset($_POST['submit_myipms_settings'])) {
+                    check_admin_referer('security_blocker_update');
+                    
+                    $enabled = (isset($_POST['myipms_enabled']) && $_POST['myipms_enabled'] === '1') ? '1' : '0';
+                    $mode = sanitize_text_field($_POST['myipms_mode']);
+                    
+                    $old_enabled = get_option('asb_myipms_enabled');
+                    
+                    update_option('asb_myipms_enabled', $enabled);
+                    update_option('asb_myipms_mode', $mode);
+                    
+                    // Управление CRON
+                    if ($enabled === '1' && $old_enabled !== '1') {
+                        if (!wp_next_scheduled('asb_myipms_update_event')) {
+                            wp_schedule_event(time(), 'hourly', 'asb_myipms_update_event');
+                        }
+                        // Запуск обновления сразу при включении
+                        $this->process_myipms_update();
+                        echo '<div class="notice notice-success"><p>Myip.ms включен и обновление запущено.</p></div>';
+                    } elseif ($enabled === '0') {
+                        wp_clear_scheduled_hook('asb_myipms_update_event');
+                        // Очистка при отключении
+                        $this->clean_myipms_rules(); 
+                        echo '<div class="notice notice-success"><p>Myip.ms отключен, правила удалены.</p></div>';
+                    } else {
+                        // Если просто поменяли настройки, но он был включен - обновляем
+                        $this->process_myipms_update();
+                        echo '<div class="notice notice-success"><p>Настройки сохранены и применены.</p></div>';
+                    }
+                }
+                ?>
+
+                <form method="post">
+                    <?php wp_nonce_field('security_blocker_update'); ?>
+                    <table class="form-table">
+                        <tr>
+                            <th><label for="myipms_enabled">Включить обновление:</label></th>
+                            <td>
+                                <input type="checkbox" id="myipms_enabled" name="myipms_enabled" value="1" <?php checked(get_option('asb_myipms_enabled')); ?>>
+                                <p class="description">Включает ежечасное скачивание черных списков с Myip.ms.</p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th><label>Режим блокировки:</label></th>
+                            <td>
+                                <fieldset>
+                                    <label>
+                                        <input type="radio" name="myipms_mode" value="htaccess" <?php checked(get_option('asb_myipms_mode'), 'htaccess'); ?>>
+                                        <strong>.htaccess (Рекомендуется)</strong> — Блокировка на уровне сервера. Быстро, но увеличивает размер файла .htaccess.
+                                    </label><br><br>
+                                    <label>
+                                        <input type="radio" name="myipms_mode" value="wp" <?php checked(get_option('asb_myipms_mode'), 'wp'); ?>>
+                                        <strong>WP Blocking (PHP)</strong> — Блокировка на уровне WordPress. Не нагружает .htaccess, но требует запуска PHP.
+                                    </label>
+                                </fieldset>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th>Последнее обновление:</th>
+                            <td>
+                                <strong><?php echo esc_html(get_option('asb_myipms_last_update', 'Никогда')); ?></strong>
+                            </td>
+                        </tr>
+                    </table>
+                    <p>
+                        <button type="submit" name="submit_myipms_settings" class="button button-primary">Сохранить настройки</button>
+                        <button type="button" id="force_update_myipms" class="button">Обновить сейчас</button>
+                        <span class="spinner" id="myipms_spinner" style="float:none;"></span>
+                    </p>
+                </form>
+                
+                <script>
+                jQuery(document).ready(function($){
+                    $('#force_update_myipms').click(function(e){
+                        e.preventDefault();
+                        $('#myipms_spinner').addClass('is-active');
+                        $.post(asb_ajax.ajax_url, {
+                            action: 'asb_run_myipms_update',
+                            nonce: asb_ajax.nonce
+                        }, function(response) {
+                            $('#myipms_spinner').removeClass('is-active');
+                            alert(response.data.message);
+                            location.reload();
+                        });
+                    });
+                });
+                </script>
+            </div>
 
                 <!-- 6. Управление блокировками -->
                 <div id="tab-manage-blocks" class="security-tab-content">
@@ -3120,21 +4265,150 @@ public function generate_nginx_fragment() {
                     </div>
 
                     <div class="card">
-                        <h3>Ручная блокировка IP</h3>
-                        <form method="post">
-                            <?php wp_nonce_field('security_blocker_update'); ?>
+                        <h3>Ручная блокировка IP (Массовая + AJAX)</h3>
+                        
+                        <!-- Стили для прогресс-бара -->
+                        <style>
+                            #asb-progress-wrapper { display: none; margin-top: 15px; border: 1px solid #ccd0d4; background: #fff; padding: 15px; }
+                            .asb-progress-container { width: 100%; background-color: #f0f0f1; border-radius: 3px; height: 20px; overflow: hidden; margin-bottom: 10px; box-shadow: inset 0 1px 2px rgba(0,0,0,.1); }
+                            .asb-progress-bar { width: 0%; height: 100%; background-color: #2271b1; transition: width 0.2s; }
+                            #asb-process-log { max-height: 150px; overflow-y: auto; background: #f6f7f7; padding: 10px; border: 1px solid #dcdcde; font-size: 12px; font-family: monospace; white-space: pre-wrap; }
+                            .log-success { color: green; }
+                            .log-error { color: red; }
+                            .asb-working { opacity: 0.6; pointer-events: none; }
+                        </style>
+
+                        <form method="post" id="asb_manual_block_form">
                             <table class="form-table">
                                 <tr>
-                                    <th><label for="manual_block_ip">IP/ CIDR / ASN:</label></th>
-                                    <td><input type="text" name="manual_block_ip" id="manual_block_ip" class="regular-text" placeholder="192.168.0.1 или 192.168.0.0/24 или AS15169"></td>
+                                    <th><label for="manual_block_ip">IP / CIDR / ASN:<br><span class="description">(по одному в строке)</span></label></th>
+                                    <td>
+                                        <textarea name="manual_block_ip" id="manual_block_ip" rows="5" class="large-text code" placeholder="192.168.0.1&#10;192.168.0.0/24&#10;AS15169"></textarea>
+                                    </td>
                                 </tr>
                                 <tr>
                                     <th><label for="block_reason">Причина:</label></th>
-                                    <td><input type="text" name="block_reason" id="block_reason" class="regular-text" placeholder="Нежелательный трафик"></td>
+                                    <td><input type="text" name="block_reason" id="block_reason" class="regular-text" placeholder="Спам / Атака"></td>
                                 </tr>
                             </table>
-                            <p><button type="submit" name="submit_manual_block" class="button button-primary">Заблокировать</button></p>
+                            <p>
+                                <button type="submit" id="asb_start_block_btn" class="button button-primary">Заблокировать список</button>
+                                <span class="spinner" id="asb_spinner" style="float:none;"></span>
+                            </p>
                         </form>
+
+                        <!-- Контейнер прогресса -->
+                        <div id="asb-progress-wrapper">
+                            <div style="margin-bottom: 5px;"><strong>Прогресс:</strong> <span id="asb-progress-text">0%</span></div>
+                            <div class="asb-progress-container">
+                                <div class="asb-progress-bar" id="asb-progress-bar"></div>
+                            </div>
+                            <div id="asb-process-log"></div>
+                        </div>
+
+                        <!-- Скрипт обработки -->
+                        <script>
+                        jQuery(document).ready(function($){
+                            $('#asb_manual_block_form').on('submit', function(e){
+                                e.preventDefault();
+                                
+                                var rawText = $('#manual_block_ip').val();
+                                var reason = $('#block_reason').val();
+                                
+                                // Разбиваем текст на строки и убираем пустые
+                                var lines = rawText.split('\n').map(function(item){ return item.trim(); }).filter(function(item){ return item.length > 0; });
+                                
+                                if(lines.length === 0) {
+                                    alert('Введите хотя бы один IP адрес.');
+                                    return;
+                                }
+
+                                if(!confirm('Вы собираетесь обработать ' + lines.length + ' записей. Продолжить?')) {
+                                    return;
+                                }
+
+                                // Интерфейс
+                                var $form = $(this);
+                                var $btn = $('#asb_start_block_btn');
+                                var $wrapper = $('#asb-progress-wrapper');
+                                var $bar = $('#asb-progress-bar');
+                                var $text = $('#asb-progress-text');
+                                var $log = $('#asb-process-log');
+                                var $spinner = $('#asb_spinner');
+
+                                $form.addClass('asb-working');
+                                $spinner.addClass('is-active');
+                                $wrapper.slideDown();
+                                $log.html(''); // Очистка лога
+                                $bar.css('width', '0%');
+                                
+                                var total = lines.length;
+                                var processed = 0;
+                                var errors = 0;
+
+                                // Рекурсивная функция для обработки очереди
+                                function processNext(index) {
+                                    if (index >= total) {
+                                        // Завершено
+                                        $bar.css('width', '100%');
+                                        $text.text('100% (Готово)');
+                                        $log.append('<div><strong>Обработка завершена!</strong></div>');
+                                        $form.removeClass('asb-working');
+                                        $spinner.removeClass('is-active');
+                                        $('#manual_block_ip').val(''); // Очистить поле ввода
+                                        
+                                        // Обновить таблицу блокировок через 2 сек (если есть функция обновления)
+                                        if(typeof fetchBlockedIps === 'function') {
+                                            setTimeout(function(){ fetchBlockedIps(1, ''); }, 1500);
+                                        } else {
+                                            // Если нет, просто перезагружаем страницу
+                                            setTimeout(function(){ location.reload(); }, 2000);
+                                        }
+                                        return;
+                                    }
+
+                                    var ip = lines[index];
+                                    var percent = Math.round(((index) / total) * 100);
+                                    
+                                    $bar.css('width', percent + '%');
+                                    $text.text(percent + '% (' + (index + 1) + '/' + total + ')');
+
+                                    $.ajax({
+                                        url: asb_ajax.ajax_url,
+                                        type: 'POST',
+                                        data: {
+                                            action: 'asb_batch_block_ip',
+                                            nonce: asb_ajax.nonce,
+                                            ip: ip,
+                                            reason: reason
+                                        },
+                                        success: function(response) {
+                                            if(response.success) {
+                                                $log.append('<div class="log-success">✓ ' + response.data.message + '</div>');
+                                            } else {
+                                                errors++;
+                                                var msg = response.data ? response.data.message : 'Ошибка';
+                                                $log.append('<div class="log-error">✗ ' + msg + '</div>');
+                                            }
+                                            // Прокрутка лога вниз
+                                            $log.scrollTop($log[0].scrollHeight);
+                                            // Следующий
+                                            processNext(index + 1);
+                                        },
+                                        error: function() {
+                                            errors++;
+                                            $log.append('<div class="log-error">✗ Ошибка сети: ' + ip + '</div>');
+                                            processNext(index + 1);
+                                        }
+                                    });
+                                }
+
+                                // Запуск
+                                $log.append('<div>Начало обработки...</div>');
+                                processNext(0);
+                            });
+                        });
+                        </script>
                     </div>
                 </div>
 
@@ -3208,8 +4482,7 @@ public function generate_nginx_fragment() {
                             <li>Таблица разблокировок: <?php echo $wpdb->get_var("SHOW TABLES LIKE '{$wpdb->prefix}security_unblock_history'") ? '<span style="color:green">✓ создана</span>' : '<span style="color:red">✗ нет</span>'; ?></li>
                             <li>Последняя резервная копия: <?php
                                 $bks = glob($this->backup_dir . 'htaccess-*.bak');
-                                echo $bks ? '<span style="color:green">' . date('d.m.Y H:i:s', filemtime($bks[0])) . '</span>' : '<span style="color:orange">не создана</span>';
-                                ?></li>
+                                echo $bks ? '<span style="color:green">' . date('d.m.Y H:i:s', filemtime($bks[0])) . '</span>' : '<span style="color:orange">не создана</span>'; ?></li>
                             <li>Кешированных ASN‑файлов: <?php echo count(glob($this->cache_dir . 'asn_*.json')); ?></li>
                             <li>Ваш IP: <strong><?php echo esc_html($current_user_ip); ?></strong></li>
                             <li>Cloudflare настроен: <?php echo $this->is_cloudflare_configured() ? '<span style="color:green">✓</span>' : '<span style="color:orange">✗ не настроен</span>'; ?></li>
@@ -3477,11 +4750,11 @@ public function generate_nginx_fragment() {
                 fetchBlockedIps(1, search); // При поиске всегда переходим на 1 страницу
             });
         });
-			
+						
         </script>
         <?php
     }
-
+	
     /* ==========================================================
        20. Регистрация настроек Cloudflare
        ========================================================== */
